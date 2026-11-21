@@ -71,7 +71,7 @@ Images are public and pinned by digest: `ghcr.io/sourcenetwork/orbis-rs` (jubjub
 Once per machine:
 
 ```bash
-export PATH="$HOME/orbis-git-poc/bin:$PATH"   # put it in your shell rc
+export PATH="$HOME/git-orbis/bin:$PATH"   # put it in your shell rc
 git orbis install                             # global filter + creates ~/.ssh/git-orbis, prints your DID
 ```
 
@@ -80,7 +80,7 @@ After that a plain `git clone` of a repo using git-orbis decrypts on its own. If
 Adding it to a repo:
 
 ```bash
-mkdir -p .orbis && cp ~/orbis-git-poc/.orbis-ring.env .orbis/config
+mkdir -p .orbis && cp ~/git-orbis/.orbis-ring.env .orbis/config
 git orbis whoami > .orbis/readers
 echo '.env filter=orbis' >> .gitattributes
 git add -A && git commit -m "encrypted env"
