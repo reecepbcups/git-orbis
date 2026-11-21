@@ -5,7 +5,8 @@
 #
 #   git orbis install         once per machine: global filter + your identity
 #   git orbis whoami          print your DID, offers to create an identity
-#   git orbis grant <did>     add a reader and grant them every tracked secret
+#   git orbis grant <did> [team]  add a reader (or team member), grant what they can now read
+#   git orbis sync            write .gitattributes from .orbis/access, re-grant every file
 #   git orbis refresh         decrypt again, e.g. after you got access
 #   git orbis init            filter for this clone only (instead of install)
 #   git orbis clean|smudge    called by git, not you
@@ -61,6 +62,63 @@ cmd_whoami() {
 
 readers() { grep -v '^#' "$(top)/.orbis/readers" 2>/dev/null | awk 'NF{print $1}'; }
 
+# worktree copy, or the index/HEAD one mid-checkout
+repo_file() {
+  local f; f="$(top)/$1"
+  if [ -f "$f" ]; then cat "$f"; return; fi
+  git show ":$1" 2>/dev/null || git show "HEAD:$1" 2>/dev/null || true
+}
+
+access_rules() { repo_file .orbis/access | grep -v '^[[:space:]]*#' | awk 'NF' || true; }
+
+# @all is .orbis/readers so repos from before teams keep working
+team() { # name
+  if [ "$1" = all ]; then readers; return; fi
+  local line
+  line="$(repo_file .orbis/teams | grep -E "^$1:")" || die "unknown team @$1"
+  awk '{for (i = 2; i <= NF; i++) print $i}' <<<"$line"
+}
+
+# DIDs that may read path. last matching .orbis/access line wins, like CODEOWNERS.
+# git does the pattern matching so it agrees with .gitattributes.
+readers_for() { # path
+  local attrs n owner
+  [ -n "$1" ] || { readers; return; }
+  attrs="$(mktemp)"
+  access_rules | awk '{print $1, "orbis-rule=" NR}' >"$attrs"
+  n="$(cd "$(top)" && git -c core.attributesFile="$attrs" check-attr orbis-rule -- "$1" | awk -F': ' '{print $3}')"
+  rm -f "$attrs"
+  # not in .orbis/access (e.g. only in .gitattributes), fall back to @all
+  [[ "$n" =~ ^[0-9]+$ ]] || { readers; return; }
+  for owner in $(access_rules | sed -n "${n}p" | awk '{$1 = ""; print}'); do
+    case "$owner" in
+      @*) team "${owner#@}" ;;
+      did:key:*) echo "$owner" ;;
+      *) die "bad owner '$owner' in .orbis/access" ;;
+    esac
+  done | sort -u
+}
+
+filtered_files() { git ls-files | git check-attr --stdin filter | awk -F': ' '$3=="orbis"{print $1}'; }
+
+# grant the current version of every filtered file to whoever may read it.
+# with a did, only that did.
+grant_files() { # [did]
+  local only="${1:-}" path ptr oid dids did
+  cd "$(top)"
+  while IFS= read -r path; do
+    ptr="$(git show ":$path" 2>/dev/null)" || continue
+    [ "$(head -1 <<<"$ptr")" = "$MAGIC" ] || continue
+    oid="$(sed -n 's/^object: //p' <<<"$ptr")"
+    dids="$(readers_for "$path")" || exit 1
+    for did in $dids; do
+      [ -z "$only" ] || [ "$did" = "$only" ] || continue
+      grant "$oid" "$did"
+      echo "granted $did on $path"
+    done
+  done < <(filtered_files)
+}
+
 grant() { # object_id did
   # clap counts the env var as conflicting with --actor-did
   ORBIS_READER_DID_PK= env -u ORBIS_READER_DID_PK "$ORBIS_CLI" set-relationship-on-chain --policy-id "$ORBIS_POLICY_ID" --object-id "$1" \
@@ -68,19 +126,21 @@ grant() { # object_id did
     || die "grant $2 on $1 failed"
 }
 
-cmd_clean() {
-  local tmp sha cached oid b64 out
+cmd_clean() { # path
+  local tmp sha cached oid b64 out dids
   tmp="$(mktemp)"; trap 'rm -f "$tmp"' RETURN
   cat >"$tmp"
   # already a pointer (e.g. someone without access), keep it as is
   if [ "$(head -1 "$tmp")" = "$MAGIC" ]; then cat "$tmp"; return; fi
 
-  # same plaintext -> same pointer, otherwise git sees endless diffs
-  sha="$(shasum -a 256 "$tmp" | cut -d' ' -f1)"
+  # same plaintext -> same pointer, otherwise git sees endless diffs.
+  # keyed by path too, files with the same content can have different readers.
+  sha="$(cache_key "${1:-}" "$tmp")"
   cached="$(cache_dir)/$sha"
   if [ -f "$cached" ]; then cat "$cached"; return; fi
 
   load_config; need_identity
+  dids="$(readers_for "${1:-}")" || exit 1
   b64="$(base64 <"$tmp" | tr -d '\n')"
   # TODO: --secret is visible in ps on this machine. fine for a poc.
   out="$(cli store-secret --secret "$b64" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
@@ -93,10 +153,12 @@ cmd_clean() {
     --resource document >/dev/null 2>&1 || die "register object $oid failed"
   grant "$oid" "$(whoami_did)"
   local did
-  for did in $(readers); do grant "$oid" "$did"; done
+  for did in $dids; do grant "$oid" "$did"; done
 
   printf '%s\nobject: %s\n' "$MAGIC" "$oid" | tee "$cached"
 }
+
+cache_key() { { printf '%s\0' "$1"; cat "$2"; } | shasum -a 256 | cut -d' ' -f1; }
 
 cmd_smudge() {
   local tmp oid out plain sha
@@ -116,7 +178,7 @@ cmd_smudge() {
   fi
   # remember plaintext -> pointer so clean gives back the exact same blob
   base64 -d <<<"$plain" | tee "$tmp.plain"
-  sha="$(shasum -a 256 "$tmp.plain" | cut -d' ' -f1)"
+  sha="$(cache_key "${1:-}" "$tmp.plain")"
   cp "$tmp" "$(cache_dir)/$sha"
   rm -f "$tmp.plain"
 }
@@ -144,23 +206,42 @@ cmd_refresh() {
   cd "$(top)"
   while IFS= read -r path; do
     rm -f "$path" && git checkout -- "$path"
-  done < <(git ls-files | git check-attr --stdin filter | awk -F': ' '$3=="orbis"{print $1}')
+  done < <(filtered_files)
 }
 
-cmd_grant() {
-  local did="${1:-}" path ptr oid
-  [[ "$did" == did:key:* ]] || die "usage: git orbis grant did:key:..."
+cmd_grant() { # did [team]
+  local did="${1:-}" name="${2:-}" f
+  [[ "$did" == did:key:* ]] || die "usage: git orbis grant did:key:... [team]"
   load_config
   mkdir -p "$(top)/.orbis"
-  grep -qx "$did" "$(top)/.orbis/readers" 2>/dev/null || echo "$did" >>"$(top)/.orbis/readers"
-  # grant on the current version of every filtered file
-  while IFS= read -r path; do
-    ptr="$(git show ":$path" 2>/dev/null)" || continue
-    [ "$(head -1 <<<"$ptr")" = "$MAGIC" ] || continue
-    oid="$(sed -n 's/^object: //p' <<<"$ptr")"
-    grant "$oid" "$did"
-    echo "granted $did on $path"
-  done < <(git ls-files | git check-attr --stdin filter | awk -F': ' '$3=="orbis"{print $1}')
+  if [ -z "$name" ] || [ "$name" = all ]; then
+    f="$(top)/.orbis/readers"
+    grep -qx "$did" "$f" 2>/dev/null || echo "$did" >>"$f"
+  else
+    f="$(top)/.orbis/teams"
+    if grep -qE "^$name:" "$f" 2>/dev/null; then
+      grep -E "^$name:" "$f" | grep -qw -- "$did" || { sed -E "s|^($name:.*)$|\1 $did|" "$f" >"$f.tmp" && mv "$f.tmp" "$f"; }
+    else
+      echo "$name: $did" >>"$f"
+    fi
+  fi
+  grant_files "$did"
+}
+
+# .gitattributes block mirrors .orbis/access, then make sure every reader has a grant
+cmd_sync() {
+  local f tmp
+  f="$(top)/.gitattributes"; tmp="$(mktemp)"
+  [ ! -f "$f" ] || sed '/^# git-orbis begin/,/^# git-orbis end/d' "$f" >"$tmp"
+  {
+    echo "# git-orbis begin, generated from .orbis/access by git orbis sync"
+    access_rules | awk '{print $1, "filter=orbis"}'
+    echo "# git-orbis end"
+  } >>"$tmp"
+  cat "$tmp" >"$f"; rm -f "$tmp"
+  echo "wrote .gitattributes"
+  load_config
+  grant_files
 }
 
 case "${1:-}" in
@@ -171,5 +252,6 @@ case "${1:-}" in
   refresh) cmd_refresh ;;
   whoami) cmd_whoami ;;
   grant) shift; cmd_grant "$@" ;;
-  *) sed -n '2,12p' "$0"; exit 1 ;;
+  sync) cmd_sync ;;
+  *) sed -n '2,13p' "$0"; exit 1 ;;
 esac

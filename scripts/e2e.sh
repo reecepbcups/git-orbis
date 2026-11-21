@@ -1,7 +1,7 @@
 #!/bin/bash
 # End to end: alice pushes an encrypted .env to a bare "github" remote,
 # bob (reader) clones and sees plaintext, mallory (not a reader) only sees
-# the pointer, carol gets granted later. Needs `make up setup` first.
+# the pointer, carol gets added to the ops team later and only reads prod. Needs `make up setup` first.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$ROOT/scripts/env.sh"
@@ -22,6 +22,7 @@ clone() { # who
 gitq() { git -c user.name="$1" -c user.email="$1@example.com" "${@:2}"; }
 
 SECRET1="DATABASE_URL=postgres://prod:hunter2@db/app"
+PROD="STRIPE_KEY=sk_live_topsecret"
 SECRET2="DATABASE_URL=postgres://prod:rotated-$RANDOM@db/app"
 
 echo "==> alice creates repo + pushes .env"
@@ -32,8 +33,12 @@ git remote add origin "$W/origin.git"
 git orbis init >/dev/null
 mkdir .orbis; cp "$ROOT/.orbis-ring.env" .orbis/config
 printf '# alice\n%s\n# bob\n%s\n' "$(did alice)" "$(did bob)" > .orbis/readers
-echo '.env filter=orbis' > .gitattributes
+printf '# ops\nops: %s\n' "$(did alice)" > .orbis/teams
+printf '.env*  @all\n.env.production  @ops\n' > .orbis/access
+git orbis sync >/dev/null
 printf '%s\nAPI_KEY=abc123\n' "$SECRET1" > .env
+echo "DEBUG=1" > .env.development
+echo "$PROD" > .env.production
 echo "hello" > README.md
 git add -A
 gitq alice commit -qm "init with encrypted env"
@@ -42,7 +47,7 @@ git push -q origin main
 echo "==> what github sees"
 blob="$(git -C "$W/origin.git" show main:.env)"
 head -1 <<<"$blob" | grep -qx "orbis-git v1" && ok "committed .env is a pointer" || fail "not a pointer: $blob"
-git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -q hunter2 \
+git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -qE 'hunter2|DEBUG=1|topsecret' \
   && fail "plaintext leaked into remote objects" || ok "no plaintext in any remote object"
 [ "$(cat .env)" = "$(printf '%s\nAPI_KEY=abc123' "$SECRET1")" ] && ok "alice working copy still plaintext" || fail "alice .env changed"
 [ -z "$(git status --porcelain)" ] && ok "alice tree clean" || fail "alice dirty: $(git status --porcelain)"
@@ -50,6 +55,8 @@ git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -q hunter2 \
 echo "==> bob (reader) clones"
 clone bob
 grep -q hunter2 "$W/bob/.env" && ok "bob decrypts .env" || fail "bob got: $(cat "$W/bob/.env")"
+grep -q DEBUG=1 "$W/bob/.env.development" && ok "bob decrypts .env.development" || fail "bob dev: $(cat "$W/bob/.env.development")"
+head -1 "$W/bob/.env.production" | grep -qx "orbis-git v1" && ok "bob (not ops) can't read .env.production" || fail "bob read prod"
 [ -z "$(as bob git status --porcelain)" ] && ok "bob tree clean" || fail "bob dirty"
 
 echo "==> mallory (not a reader) clones"
@@ -72,12 +79,13 @@ echo "==> history stays readable for readers"
 old="$(as bob git show HEAD~1:.env | as bob git orbis smudge .env)"
 grep -q hunter2 <<<"$old" && ok "bob decrypts old version from history" || fail "history: $old"
 
-echo "==> alice grants carol"
+echo "==> alice adds carol to ops"
 cd "$W/alice"
-git orbis grant "$(did carol)" >/dev/null
-gitq alice commit -qam "add carol to readers"
+git orbis grant "$(did carol)" ops >/dev/null
+gitq alice commit -qam "add carol to ops"
 git push -q origin main
-clone carol
-grep -q "rotated" "$W/carol/.env" && ok "carol decrypts after grant" || fail "carol got: $(cat "$W/carol/.env")"
+clone carol 2>/dev/null
+grep -q topsecret "$W/carol/.env.production" && ok "carol decrypts .env.production" || fail "carol got: $(cat "$W/carol/.env.production")"
+head -1 "$W/carol/.env" | grep -qx "orbis-git v1" && ok "carol (not @all) can't read .env" || fail "carol read .env"
 
 echo "PASS ($pass checks)"
