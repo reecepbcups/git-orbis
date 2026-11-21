@@ -3,10 +3,11 @@
 # commits a pointer. Anything that speaks git (GitHub included) only sees
 # the pointer.
 #
-#   git orbis install         wire the filter into every repo (global config)
-#   git orbis init            wire the filter into this clone only
-#   git orbis whoami          print your reader DID
+#   git orbis install         once per machine: global filter + your identity
+#   git orbis whoami          print your DID, offers to create an identity
 #   git orbis grant <did>     add a reader and grant them every tracked secret
+#   git orbis refresh         decrypt again, e.g. after you got access
+#   git orbis init            filter for this clone only (instead of install)
 #   git orbis clean|smudge    called by git, not you
 set -euo pipefail
 
@@ -29,8 +30,33 @@ load_config() {
   source /dev/stdin <<<"$blob"
 }
 
+# identity seed: env var wins, otherwise the saved file
+IDENTITY_FILE="${ORBIS_IDENTITY_FILE:-$HOME/.ssh/git-orbis}"
+if [ -z "${ORBIS_READER_DID_PK:-}" ] && [ -f "$IDENTITY_FILE" ]; then
+  ORBIS_READER_DID_PK="$(cat "$IDENTITY_FILE")"
+  export ORBIS_READER_DID_PK
+fi
+
 need_identity() {
-  [ -n "${ORBIS_READER_DID_PK:-}" ] || die "set ORBIS_READER_DID_PK to your identity seed"
+  [ -n "${ORBIS_READER_DID_PK:-}" ] || die "no identity, run 'git orbis whoami' to create one"
+}
+
+# only from a terminal. filters run without one and must never prompt.
+create_identity() {
+  [ -t 0 ] || die "no identity, run 'git orbis whoami' in a terminal to create one"
+  local answer
+  read -r -p "No git-orbis identity found. Create one at $IDENTITY_FILE? [y/N] " answer
+  [[ "$answer" =~ ^[yY] ]] || die "no identity created"
+  mkdir -p "$(dirname "$IDENTITY_FILE")" && chmod 700 "$(dirname "$IDENTITY_FILE")"
+  (umask 077 && openssl rand -hex 32 >"$IDENTITY_FILE")
+  ORBIS_READER_DID_PK="$(cat "$IDENTITY_FILE")"
+  export ORBIS_READER_DID_PK
+  echo "saved. back it up, losing it means losing access." >&2
+}
+
+cmd_whoami() {
+  [ -n "${ORBIS_READER_DID_PK:-}" ] || create_identity
+  whoami_did
 }
 
 readers() { grep -v '^#' "$(top)/.orbis/readers" 2>/dev/null | awk 'NF{print $1}'; }
@@ -106,6 +132,21 @@ cmd_init() { # [--global]
   echo "git-orbis filter installed${scope:+ ($scope)}"
 }
 
+# one time per machine: global filter + identity, then plain clones just work
+cmd_install() {
+  cmd_init --global
+  cmd_whoami
+}
+
+# re-run the decrypt, e.g. after someone granted you access
+cmd_refresh() {
+  local path
+  cd "$(top)"
+  while IFS= read -r path; do
+    rm -f "$path" && git checkout -- "$path"
+  done < <(git ls-files | git check-attr --stdin filter | awk -F': ' '$3=="orbis"{print $1}')
+}
+
 cmd_grant() {
   local did="${1:-}" path ptr oid
   [[ "$did" == did:key:* ]] || die "usage: git orbis grant did:key:..."
@@ -126,8 +167,9 @@ case "${1:-}" in
   clean) shift; cmd_clean "$@" ;;
   smudge) shift; cmd_smudge "$@" ;;
   init) cmd_init ;;
-  install) cmd_init --global ;; # like git lfs install, every clone gets the filter
-  whoami) whoami_did ;;
+  install) cmd_install ;;
+  refresh) cmd_refresh ;;
+  whoami) cmd_whoami ;;
   grant) shift; cmd_grant "$@" ;;
-  *) sed -n '2,11p' "$0"; exit 1 ;;
+  *) sed -n '2,12p' "$0"; exit 1 ;;
 esac

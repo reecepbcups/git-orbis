@@ -66,25 +66,34 @@ make down    # wipes the chain. pointers made against it are dead after this
 
 Images are public and pinned by digest: `ghcr.io/sourcenetwork/orbis-rs` (jubjub build) and `ghcr.io/sourcenetwork/vera` (the `:dev` build from 2026-11-12).
 
-## Using it in a repo
+## Using it
+
+Once per machine:
 
 ```bash
-export PATH=/path/to/git-orbis/bin:$PATH
-export ORBIS_READER_DID_PK=<your identity seed>   # treat it like a password
+export PATH="$HOME/orbis-git-poc/bin:$PATH"   # put it in your shell rc
+git orbis install                             # global filter + creates ~/.ssh/git-orbis, prints your DID
+```
 
-git orbis init                                   # once per clone, before checkout
-mkdir -p .orbis && cp /path/to/git-orbis/.orbis-ring.env .orbis/config
+After that a plain `git clone` of a repo using git-orbis decrypts on its own. If you got access after cloning, `git orbis refresh`.
+
+Adding it to a repo:
+
+```bash
+mkdir -p .orbis && cp ~/orbis-git-poc/.orbis-ring.env .orbis/config
+git orbis whoami > .orbis/readers
 echo '.env filter=orbis' >> .gitattributes
-git orbis whoami                                 # your DID, send it to whoever manages access
-git orbis grant did:key:z6Mk...                  # give someone access, then commit .orbis/readers
+git add -A && git commit -m "encrypted env"
 ```
 
-When you clone an existing repo, run `git orbis init` before checking out, so the filter's there when `.env` gets written:
+Giving someone access:
 
 ```bash
-git clone --no-checkout <url> app && cd app
-git orbis init && git checkout main
+git orbis grant did:key:z6Mk...
+git commit -am "give <name> access" && git push
 ```
+
+Your identity seed lives in `~/.ssh/git-orbis` (0600). `ORBIS_READER_DID_PK` overrides it, `ORBIS_IDENTITY_FILE` moves it. `git orbis init` sets the filter for one clone only if you'd rather not touch your global config.
 
 ## Known gaps
 
