@@ -51,6 +51,16 @@ git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -qE 'hunter2|
   && fail "plaintext leaked into remote objects" || ok "no plaintext in any remote object"
 [ "$(cat .env)" = "$(printf '%s\nAPI_KEY=abc123' "$SECRET1")" ] && ok "alice working copy still plaintext" || fail "alice .env changed"
 [ -z "$(git status --porcelain)" ] && ok "alice tree clean" || fail "alice dirty: $(git status --porcelain)"
+[ "$(git -C "$W/origin.git" show main:README.md)" = hello ] && ok "files outside .orbis/access stay plaintext" || fail "README got filtered"
+
+echo "==> new rule works without sync"
+echo '.secrets/*  @all' >> .orbis/access
+mkdir .secrets; echo "TOKEN=staging-only" > .secrets/staging
+git add -A
+gitq alice commit -qm "add staging secret"
+git push -q origin main
+git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -q staging-only \
+  && fail "staging leaked" || ok "new pattern encrypted, no sync needed"
 
 echo "==> bob (reader) clones"
 clone bob
