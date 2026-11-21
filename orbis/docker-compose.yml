@@ -1,0 +1,106 @@
+# Local Vera + 3 Orbis nodes (jubjub). Trimmed copy of shieldd's
+# deployments/orbis stack, no defra. Passwords and keys here are local fixtures.
+x-node: &node
+  image: ${ORBIS_IMAGE:-ghcr.io/sourcenetwork/orbis-rs@sha256:2cf79b0524e73a7b4f069b6a288c7f18e91d8c87aba8f785cd874d07ee76d59e}
+  restart: on-failure
+  networks: [orbis]
+  depends_on:
+    vera:
+      condition: service_healthy
+
+x-node-cmd: &node-cmd ["--addr", "0.0.0.0:50051", "--log-level", "info", "--services-config", "/etc/orbis/services.json", "--network-bind-addr", "0.0.0.0:9001", "--metrics-addr", "0.0.0.0:9090", "--reshare-interval-secs", "5", "--node-controller-key", "024f4e2ad99c34d60b9ba6283c9431a8418af8673212961f97a77b6377fcd05b62"]
+
+services:
+  vera:
+    image: ${VERA_IMAGE:-shieldd-vera:lift-d562cf4f86a6}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ ! -f /home/node/.vera/config/config.toml ]; then
+          verad init local-node --chain-id vera-localnet --home /home/node/.vera
+          verad keys add validator --keyring-backend test --home /home/node/.vera
+          echo "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" | verad keys add test --recover --keyring-backend test --home /home/node/.vera
+          echo "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art" | verad keys add funder --recover --keyring-backend test --home /home/node/.vera
+          verad genesis add-genesis-account validator 100000000000uopen --keyring-backend test --home /home/node/.vera
+          verad genesis add-genesis-account test 100000000000uopen --keyring-backend test --home /home/node/.vera
+          verad genesis add-genesis-account funder 100000000000uopen --keyring-backend test --home /home/node/.vera
+          verad genesis gentx validator 10000000000uopen --keyring-backend test --chain-id vera-localnet --home /home/node/.vera
+          verad genesis collect-gentxs --home /home/node/.vera
+        fi
+        exec verad start --home /home/node/.vera --rpc.laddr tcp://0.0.0.0:26657 --api.enable --api.address tcp://0.0.0.0:1317
+    volumes: [vera-data:/home/node/.vera]
+    ports:
+      - "127.0.0.1:39657:26657"
+      - "127.0.0.1:39317:1317"
+      - "127.0.0.1:39090:9090"
+    networks: [orbis]
+    healthcheck:
+      test: ["CMD", "verad", "status", "--home", "/home/node/.vera"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  node1:
+    <<: *node
+    command: *node-cmd
+    environment: [ORBIS_PASSWORD=testpassword123, ORBIS_SECRET_KEY=testsecret1testsecret1, RUST_LOG=info]
+    volumes: [orbis-node1-data:/data, ./services.json:/etc/orbis/services.json:ro]
+    ports: ["127.0.0.1:39051:50051"]
+
+  node2:
+    <<: *node
+    command: *node-cmd
+    environment: [ORBIS_PASSWORD=testpassword123, ORBIS_SECRET_KEY=testsecret2testsecret2, RUST_LOG=info]
+    volumes: [orbis-node2-data:/data, ./services.json:/etc/orbis/services.json:ro]
+    ports: ["127.0.0.1:39052:50051"]
+
+  node3:
+    <<: *node
+    command: *node-cmd
+    environment: [ORBIS_PASSWORD=testpassword123, ORBIS_SECRET_KEY=testsecret3testsecret3, RUST_LOG=info]
+    volumes: [orbis-node3-data:/data, ./services.json:/etc/orbis/services.json:ro]
+    ports: ["127.0.0.1:39053:50051"]
+
+  # nodes don't self-fund, so pay each one's vera account from the genesis funder
+  funder:
+    image: ${VERA_IMAGE:-shieldd-vera:lift-d562cf4f86a6}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        H=/tmp/funder
+        echo "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art" \
+          | verad keys add funder --recover --keyring-backend test --home "$$H" --no-backup >/dev/null 2>&1 || true
+        for d in /n1 /n2 /n3; do
+          until [ -s "$$d/public_key.txt" ]; do echo "waiting for $$d"; sleep 3; done
+        done
+        until verad query block --type=height 1 --node tcp://vera:26657 >/dev/null 2>&1; do sleep 2; done
+        addrs="$$(cat /n1/public_key.txt) $$(cat /n2/public_key.txt) $$(cat /n3/public_key.txt)"
+        n=0
+        until out=$$(verad tx bank multi-send funder $$addrs 1000000000uopen \
+              --keyring-backend test --home "$$H" --chain-id vera-localnet \
+              --node tcp://vera:26657 --fees 2000uopen --yes -o json 2>&1) \
+              && echo "$$out" | grep -q '"code":0'; do
+          n=$$((n+1)); [ "$$n" -gt 60 ] && { echo "funding failed: $$out"; exit 1; }
+          sleep 3
+        done
+        for a in $$addrs; do
+          until verad query bank balances "$$a" --node tcp://vera:26657 -o json 2>/dev/null | grep -q uopen; do sleep 2; done
+        done
+        echo "orbis funding complete"
+    volumes: [orbis-node1-data:/n1:ro, orbis-node2-data:/n2:ro, orbis-node3-data:/n3:ro]
+    networks: [orbis]
+    depends_on:
+      vera:
+        condition: service_healthy
+
+networks:
+  orbis: {}
+
+volumes:
+  vera-data: {}
+  orbis-node1-data: {}
+  orbis-node2-data: {}
+  orbis-node3-data: {}

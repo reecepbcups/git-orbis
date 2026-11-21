@@ -1,0 +1,130 @@
+#!/bin/bash
+# git-orbis: clean/smudge filter that keeps file contents in Orbis and only
+# commits a pointer. Anything that speaks git (GitHub included) only sees
+# the pointer.
+#
+#   git orbis init            wire the filter into this clone
+#   git orbis whoami          print your reader DID
+#   git orbis grant <did>     add a reader and grant them every tracked secret
+#   git orbis clean|smudge    called by git, not you
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/../scripts/env.sh"
+MAGIC="orbis-git v1"
+
+die() { echo "git-orbis: $*" >&2; exit 1; }
+cli() { "$ORBIS_CLI" "$@"; }
+top() { git rev-parse --show-toplevel; }
+cache_dir() { local d; d="$(git rev-parse --git-dir)/orbis"; mkdir -p "$d"; echo "$d"; }
+
+load_config() {
+  local cfg; cfg="$(top)/.orbis/config"
+  if [ -f "$cfg" ]; then source "$cfg"; return; fi
+  # mid-checkout the file may not be written yet, so read it from git
+  local blob
+  blob="$(git show :.orbis/config 2>/dev/null || git show HEAD:.orbis/config 2>/dev/null)" \
+    || die "missing .orbis/config"
+  source /dev/stdin <<<"$blob"
+}
+
+need_identity() {
+  [ -n "${ORBIS_READER_DID_PK:-}" ] || die "set ORBIS_READER_DID_PK to your identity seed"
+}
+
+readers() { grep -v '^#' "$(top)/.orbis/readers" 2>/dev/null | awk 'NF{print $1}'; }
+
+grant() { # object_id did
+  # clap counts the env var as conflicting with --actor-did
+  ORBIS_READER_DID_PK= env -u ORBIS_READER_DID_PK "$ORBIS_CLI" set-relationship-on-chain --policy-id "$ORBIS_POLICY_ID" --object-id "$1" \
+    --resource document --relation reader --actor-did "$2" >/dev/null 2>&1 \
+    || die "grant $2 on $1 failed"
+}
+
+cmd_clean() {
+  local tmp sha cached oid b64 out
+  tmp="$(mktemp)"; trap 'rm -f "$tmp"' RETURN
+  cat >"$tmp"
+  # already a pointer (e.g. someone without access), keep it as is
+  if [ "$(head -1 "$tmp")" = "$MAGIC" ]; then cat "$tmp"; return; fi
+
+  # same plaintext -> same pointer, otherwise git sees endless diffs
+  sha="$(shasum -a 256 "$tmp" | cut -d' ' -f1)"
+  cached="$(cache_dir)/$sha"
+  if [ -f "$cached" ]; then cat "$cached"; return; fi
+
+  load_config; need_identity
+  b64="$(base64 <"$tmp" | tr -d '\n')"
+  # TODO: --secret is visible in ps on this machine. fine for a poc.
+  out="$(cli store-secret --secret "$b64" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
+    --policy-id "$ORBIS_POLICY_ID" --resource document --permission read --with-proof 2>&1)" \
+    || die "store-secret failed: $out"
+  oid="$(grep 'Object ID:' <<<"$out" | sed 's/.*Object ID: //')"
+  [ -n "$oid" ] || die "no object id from store-secret"
+
+  cli register-object-to-chain --policy-id "$ORBIS_POLICY_ID" --object-id "$oid" \
+    --resource document >/dev/null 2>&1 || die "register object $oid failed"
+  grant "$oid" "$(whoami_did)"
+  local did
+  for did in $(readers); do grant "$oid" "$did"; done
+
+  printf '%s\nobject: %s\n' "$MAGIC" "$oid" | tee "$cached"
+}
+
+cmd_smudge() {
+  local tmp oid out plain sha
+  tmp="$(mktemp)"; trap 'rm -f "$tmp"' RETURN
+  cat >"$tmp"
+  if [ "$(head -1 "$tmp")" != "$MAGIC" ]; then cat "$tmp"; return; fi
+
+  oid="$(sed -n 's/^object: //p' "$tmp")"
+  load_config
+  # no access shouldn't break checkout. leave the pointer in place.
+  if [ -z "${ORBIS_READER_DID_PK:-}" ] \
+    || ! out="$(cli pre --ring-pk "$ORBIS_RING_PK" --object-id "$oid" 2>&1)" \
+    || ! plain="$(grep 'Decrypted Secret:' <<<"$out" | sed 's/.*Decrypted Secret: //')" \
+    || [ -z "$plain" ]; then
+    echo "git-orbis: no access to ${1:-file} (object $oid), leaving pointer" >&2
+    cat "$tmp"; return
+  fi
+  # remember plaintext -> pointer so clean gives back the exact same blob
+  base64 -d <<<"$plain" | tee "$tmp.plain"
+  sha="$(shasum -a 256 "$tmp.plain" | cut -d' ' -f1)"
+  cp "$tmp" "$(cache_dir)/$sha"
+  rm -f "$tmp.plain"
+}
+
+whoami_did() { need_identity; cli reader-did | cut -d= -f2; }
+
+cmd_init() {
+  git config filter.orbis.clean "\"$HERE/git-orbis\" clean %f"
+  git config filter.orbis.smudge "\"$HERE/git-orbis\" smudge %f"
+  # if clean fails git must stop, never fall back to committing plaintext
+  git config filter.orbis.required true
+  echo "git-orbis filter installed"
+}
+
+cmd_grant() {
+  local did="${1:-}" path ptr oid
+  [[ "$did" == did:key:* ]] || die "usage: git orbis grant did:key:..."
+  load_config
+  mkdir -p "$(top)/.orbis"
+  grep -qx "$did" "$(top)/.orbis/readers" 2>/dev/null || echo "$did" >>"$(top)/.orbis/readers"
+  # grant on the current version of every filtered file
+  while IFS= read -r path; do
+    ptr="$(git show ":$path" 2>/dev/null)" || continue
+    [ "$(head -1 <<<"$ptr")" = "$MAGIC" ] || continue
+    oid="$(sed -n 's/^object: //p' <<<"$ptr")"
+    grant "$oid" "$did"
+    echo "granted $did on $path"
+  done < <(git ls-files | git check-attr --stdin filter | awk -F': ' '$3=="orbis"{print $1}')
+}
+
+case "${1:-}" in
+  clean) shift; cmd_clean "$@" ;;
+  smudge) shift; cmd_smudge "$@" ;;
+  init) cmd_init ;;
+  whoami) whoami_did ;;
+  grant) shift; cmd_grant "$@" ;;
+  *) sed -n '2,10p' "$0"; exit 1 ;;
+esac

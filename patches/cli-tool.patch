@@ -1,0 +1,78 @@
+diff --git a/bin/cli-tool/src/commands/admin.rs b/bin/cli-tool/src/commands/admin.rs
+index e4a72fa..3e6c7b3 100644
+--- a/bin/cli-tool/src/commands/admin.rs
++++ b/bin/cli-tool/src/commands/admin.rs
+@@ -15,6 +15,22 @@ use super::crypto::reader_did_from_seed;
+ const TEST_POLICY_YAML: &str = r#"
+ name: test-policy
+ resources:
++  - name: ring_policy
++    relations:
++      - name: ring_creator
++        types:
++          - actor
++    permissions:
++      - name: create_ring
++        expr: ring_creator
++  - name: ring
++    relations:
++      - name: operator
++        types:
++          - actor
++    permissions:
++      - name: update_ring
++        expr: operator
+   - name: document
+     relations:
+       - name: creator
+diff --git a/bin/cli-tool/src/main.rs b/bin/cli-tool/src/main.rs
+index ab52f4e..74fce82 100644
+--- a/bin/cli-tool/src/main.rs
++++ b/bin/cli-tool/src/main.rs
+@@ -243,6 +243,11 @@ pub enum SubCommands {
+     /// DID needs a relation granted (via `set-relationship-on-chain --actor-pubkey`)
+     /// before such a transaction will be authorized.
+     DeriveSignerDid,
++    /// Print the Ed25519 did:key for a --reader-did-pk seed. Local only.
++    ReaderDid {
++        #[clap(long, env = "ORBIS_READER_DID_PK", hide_env_values = true)]
++        reader_did_pk: String,
++    },
+     /// Add a policy to the chain
+     AddPolicyToChain,
+     /// Register object to the chain
+@@ -281,6 +286,9 @@ pub enum SubCommands {
+         /// for ACP checks on signed transactions (see `derive-signer-did`).
+         #[clap(long, conflicts_with = "reader_did_pk")]
+         actor_pubkey: Option<String>,
++        /// Grant this relation to an existing did:key directly, without its seed.
++        #[clap(long, conflicts_with_all = ["reader_did_pk", "actor_pubkey"])]
++        actor_did: Option<String>,
+     },
+     /// Register a bulletin namespace
+     RegisterBulletinNamespace {
+@@ -721,6 +729,9 @@ async fn main() -> Result<()> {
+             )
+             .await?;
+         }
++        SubCommands::ReaderDid { reader_did_pk } => {
++            println!("DID={}", reader_did_from_seed(&reader_did_pk));
++        }
+         SubCommands::DeriveSignerDid => {
+             let signing_key = network.require_signing_key()?;
+             let (public_key, did) = derive_signer_did(&signing_key, network.chain_config())?;
+@@ -754,9 +765,13 @@ async fn main() -> Result<()> {
+             relation,
+             reader_did_pk,
+             actor_pubkey,
++            actor_did,
+         } => {
+             let signing_key = network.require_signing_key()?;
+-            let did_uri = resolve_relationship_actor_did(reader_did_pk, actor_pubkey)?;
++            let did_uri = match actor_did {
++                Some(did) => did,
++                None => resolve_relationship_actor_did(reader_did_pk, actor_pubkey)?,
++            };
+             set_relationship_on_chain(
+                 policy_id,
+                 object_id,
