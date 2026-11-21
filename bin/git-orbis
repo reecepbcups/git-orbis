@@ -207,7 +207,11 @@ cmd_smudge() {
 whoami_did() { need_identity; cli reader-did | cut -d= -f2; }
 
 cmd_init() { # [--global]
-  local scope="${1:-}"
+  local scope="${1:-}" proc="$ROOT/.tools/bin/orbis-filter"
+  [ -x "$proc" ] || die "missing $proc, run 'make filter'"
+  # one long running process per git command, like git-lfs. clean/smudge stay
+  # as the fallback for tools that don't speak the process protocol.
+  git config $scope filter.orbis.process "\"$proc\" \"$HERE/git-orbis\""
   git config $scope filter.orbis.clean "\"$HERE/git-orbis\" clean %f"
   git config $scope filter.orbis.smudge "\"$HERE/git-orbis\" smudge %f"
   # if clean fails git must stop, never fall back to committing plaintext
