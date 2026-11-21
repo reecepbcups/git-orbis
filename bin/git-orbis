@@ -3,7 +3,8 @@
 # commits a pointer. Anything that speaks git (GitHub included) only sees
 # the pointer.
 #
-#   git orbis init            wire the filter into this clone
+#   git orbis install         wire the filter into every repo (global config)
+#   git orbis init            wire the filter into this clone only
 #   git orbis whoami          print your reader DID
 #   git orbis grant <did>     add a reader and grant them every tracked secret
 #   git orbis clean|smudge    called by git, not you
@@ -96,12 +97,13 @@ cmd_smudge() {
 
 whoami_did() { need_identity; cli reader-did | cut -d= -f2; }
 
-cmd_init() {
-  git config filter.orbis.clean "\"$HERE/git-orbis\" clean %f"
-  git config filter.orbis.smudge "\"$HERE/git-orbis\" smudge %f"
+cmd_init() { # [--global]
+  local scope="${1:-}"
+  git config $scope filter.orbis.clean "\"$HERE/git-orbis\" clean %f"
+  git config $scope filter.orbis.smudge "\"$HERE/git-orbis\" smudge %f"
   # if clean fails git must stop, never fall back to committing plaintext
-  git config filter.orbis.required true
-  echo "git-orbis filter installed"
+  git config $scope filter.orbis.required true
+  echo "git-orbis filter installed${scope:+ ($scope)}"
 }
 
 cmd_grant() {
@@ -124,7 +126,8 @@ case "${1:-}" in
   clean) shift; cmd_clean "$@" ;;
   smudge) shift; cmd_smudge "$@" ;;
   init) cmd_init ;;
+  install) cmd_init --global ;; # like git lfs install, every clone gets the filter
   whoami) whoami_did ;;
   grant) shift; cmd_grant "$@" ;;
-  *) sed -n '2,10p' "$0"; exit 1 ;;
+  *) sed -n '2,11p' "$0"; exit 1 ;;
 esac
