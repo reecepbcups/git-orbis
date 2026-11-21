@@ -1,5 +1,7 @@
 # Local Vera + 3 Orbis nodes (jubjub). Trimmed copy of shieldd's
 # deployments/orbis stack, no defra. Passwords and keys here are local fixtures.
+# Both images are public and digest pinned. vera is the published :dev build
+# from 2026-11-12 since vera doesn't publish per-commit images we can match.
 x-node: &node
   image: ${ORBIS_IMAGE:-ghcr.io/sourcenetwork/orbis-rs@sha256:2cf79b0524e73a7b4f069b6a288c7f18e91d8c87aba8f785cd874d07ee76d59e}
   restart: on-failure
@@ -12,7 +14,7 @@ x-node-cmd: &node-cmd ["--addr", "0.0.0.0:50051", "--log-level", "info", "--serv
 
 services:
   vera:
-    image: ${VERA_IMAGE:-shieldd-vera:lift-d562cf4f86a6}
+    image: ${VERA_IMAGE:-ghcr.io/sourcenetwork/vera@sha256:321e3045c59d2213f358a328a5b299e5fd3370b714db9326e19a5fe5ac8419c5}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -65,7 +67,7 @@ services:
 
   # nodes don't self-fund, so pay each one's vera account from the genesis funder
   funder:
-    image: ${VERA_IMAGE:-shieldd-vera:lift-d562cf4f86a6}
+    image: ${VERA_IMAGE:-ghcr.io/sourcenetwork/vera@sha256:321e3045c59d2213f358a328a5b299e5fd3370b714db9326e19a5fe5ac8419c5}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
