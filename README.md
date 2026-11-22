@@ -73,7 +73,7 @@ Once per machine:
 
 ```bash
 export PATH="$HOME/git-orbis/bin:$PATH"   # put it in your shell rc
-git orbis install                             # global filter + creates ~/.ssh/git-orbis, prints your DID
+git orbis install                             # global filter, zsh completion, creates ~/.ssh/git-orbis, prints your DID
 ```
 
 After that a plain `git clone` of a repo using git-orbis decrypts on its own. If you got access after cloning, `git orbis refresh`.
@@ -144,6 +144,14 @@ The AES key (and the bundle's sha256) is the orbis secret, so only DIDs on the r
 
 No matching `branch:` rule means push-private refuses, it won't fall back to `@all`.
 
+You don't have to remember push-private either. Run `git orbis init` once in the clone and plain `git push` does it for you. It sets origin's pushurl to `orbis::<url>`, so pushes go through `git-remote-orbis`:
+
+- branch matches a `branch:` rule and you're on it - encrypted push
+- matches but you're not on it - it asks: encrypted, plaintext or abort. no terminal means abort
+- anything else - normal push
+
+Tab completion (zsh) comes with `git orbis install`. It links into `~/.oh-my-zsh/custom/completions`, no `.zshrc` edit. Without oh-my-zsh, add `~/git-orbis/completions` to your `fpath`.
+
 Your identity seed lives in `~/.ssh/git-orbis` (0600). `ORBIS_READER_DID_PK` overrides it, `ORBIS_IDENTITY_FILE` moves it. `git orbis init` sets the filter for one clone only if you'd rather not touch your global config.
 
 ## Known gaps
@@ -155,7 +163,7 @@ It's a POC, so:
 - **Forget `sync`, leak plaintext.** A new pattern in `.orbis/access` isn't encrypted until `git orbis sync` puts it in `.gitattributes`.
 - **No revoke.** Removing a reader doesn't take anything back. Rotate the actual secret (true for every git secret tool, old versions live in history).
 - **Slow-ish commits.** A changed secret costs ~7s: 1 block to store it, 1 block to register it and grant every reader in one tx. Unchanged files are instant. Blocks are 5s on the localnet, so that's most of it.
-- **Plain `git push` on a private branch leaks it.** Use `push-private`. Once the stub is on the remote a plain push gets rejected as non-fast-forward, but `-f` or the very first push goes through in plaintext.
+- **Plain `git push` only encrypts after `git orbis init`.** A clone without the orbis pushurl pushes private branches in plaintext.
 - **Private branches are last push wins.** Every `push-private` force pushes a full new bundle. Two people pushing the same one clobber each other. No PR diff view on GitHub either, merging means pushing the code to main for real.
 - **`ps` can see it.** The secret goes to `cli-tool` as `--secret` while committing.
 - **Shared writer key.** Everyone writes with the public devnet key, which owns the ACP objects.

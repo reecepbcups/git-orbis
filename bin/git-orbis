@@ -143,14 +143,21 @@ owner_dids() { # owner...
 # DIDs that may read a private branch. last matching branch: rule wins.
 # no rule fails closed, a private branch shouldn't fall back to @all.
 readers_for_branch() { # name
-  local pat owners rest
+  local owners
+  owners="$(branch_owners "$1")"
+  [ -n "$owners" ] || die "no branch: rule in .orbis/access matches $1"
+  owner_dids $owners
+}
+
+# owners column of the last branch: rule matching name, empty if none
+branch_owners() { # name
+  local pat owners= rest
   while read -r pat rest; do
     pat="${pat#branch:}"
     # shellcheck disable=SC2053 # pat is a glob on purpose
     if [[ "$1" == $pat ]]; then owners="$rest"; fi
   done < <(branch_rules)
-  [ -n "${owners:-}" ] || die "no branch: rule in .orbis/access matches $1"
-  owner_dids $owners
+  echo "$owners"
 }
 
 # files git stores as pointers. run from the top.
@@ -240,7 +247,7 @@ cmd_smudge() {
 whoami_did() { need_identity; cli reader-did | cut -d= -f2; }
 
 cmd_init() { # [--global]
-  local scope="${1:-}" proc="$ROOT/.tools/bin/orbis-filter"
+  local scope="${1:-}" proc="$ROOT/.tools/bin/orbis-filter" url
   [ -x "$proc" ] || die "missing $proc, run 'make filter'"
   # one long running process per git command, like git-lfs. clean/smudge stay
   # as the fallback for tools that don't speak the process protocol.
@@ -249,13 +256,29 @@ cmd_init() { # [--global]
   git config $scope filter.orbis.smudge "\"$HERE/git-orbis\" smudge %f"
   # if clean fails git must stop, never fall back to committing plaintext
   git config $scope filter.orbis.required true
+  # plain git push of a private branch goes through git-remote-orbis
+  if [ -z "$scope" ] && url="$(git remote get-url --push origin 2>/dev/null)" && [[ "$url" != orbis::* ]]; then
+    git config remote.origin.pushurl "orbis::$url"
+    echo "git push on origin now encrypts private branches"
+  fi
   echo "git-orbis filter installed${scope:+ ($scope)}"
 }
 
 # one time per machine: global filter + identity, then plain clones just work
 cmd_install() {
   cmd_init --global
+  install_completion
   cmd_whoami
+}
+
+# oh-my-zsh already has custom/completions on fpath, so no .zshrc edit
+install_completion() {
+  local d="$HOME/.oh-my-zsh/custom/completions"
+  [ -d "$HOME/.oh-my-zsh" ] || { echo "zsh completion: add $ROOT/completions to your fpath"; return; }
+  mkdir -p "$d" && ln -sf "$ROOT/completions/_git-orbis" "$d/_git-orbis"
+  # zsh caches completions, a stale dump hides the new one
+  rm -f "$HOME"/.zcompdump*
+  echo "zsh completion linked, open a new terminal"
 }
 
 # re-run the decrypt, e.g. after someone granted you access
@@ -331,7 +354,7 @@ cmd_sync() {
 # on top of the public base. others see it exists, never the code.
 # only the aes key lives in orbis, the bundle is too big for --secret.
 cmd_push_private() { # branch [remote] [base]
-  local name="${1:-}" remote="${2:-origin}" base="${3:-}" b dids tmp key sum b64 out oid meta blob tree commit
+  local name="${1:-}" remote="${2:-origin}" base="${3:-}" b dids tmp key sum b64 out oid meta blob tree commit url
   [ -n "$name" ] || die "usage: git orbis push-private <branch> [remote] [base]"
   git rev-parse -q --verify "refs/heads/$name" >/dev/null || die "no local branch $name"
   load_config; need_identity
@@ -368,7 +391,9 @@ cmd_push_private() { # branch [remote] [base]
   tree="$(GIT_INDEX_FILE="$tmp/index" git write-tree)"
   commit="$(git commit-tree "$tree" -p "$b" -m "orbis private branch $name")"
   # last push wins, the stub is always rebuilt on the base
-  git push -q -f "$remote" "$commit:refs/heads/$name" || die "push failed"
+  # the real url, an orbis:: pushurl would send us back through the helper
+  url="$(git remote get-url --push "$remote")"
+  git push -q -f "${url#orbis::}" "$commit:refs/heads/$name" || die "push failed"
   echo "pushed private branch $name to $remote"
 }
 
@@ -402,6 +427,90 @@ cmd_fetch_private() { # branch [remote]
   echo "fetched private branch $name"
 }
 
+# git-remote-orbis lands here when origin's pushurl is orbis::<url>.
+# private branches go to push-private, the rest is a normal push to <url>.
+# stdout is git's, so everything else goes to stderr or the tty.
+cmd_remote_helper() { # remote url
+  local remote="$1" url="$2" line
+  local -a specs=()
+  while IFS= read -r line; do
+    case "$line" in
+      capabilities) printf 'push\n\n' ;;
+      list*) helper_list "$url" ;;
+      push\ *) specs+=("${line#push }") ;;
+      '')
+        [ ${#specs[@]} -gt 0 ] || exit 0
+        helper_push "$remote" "$url" "${specs[@]}"
+        specs=()
+        ;;
+    esac
+  done
+}
+
+# real refs, minus private branches. the remote holds a stub for those, which
+# git would call non-fast-forward and never hand to us.
+helper_list() { # url
+  local sha ref
+  while read -r sha ref; do
+    case "$ref" in HEAD | *'^{}') continue ;; esac
+    [ -n "$(branch_owners "${ref#refs/heads/}")" ] && [[ "$ref" == refs/heads/* ]] && continue
+    echo "$sha $ref"
+  done < <(git ls-remote "$1")
+  echo
+}
+
+helper_push() { # remote url spec...
+  local remote="$1" url="$2" spec src dst name me out flag ref summary
+  local -a normal=() results=()
+  shift 2
+  me="$(whoami_did 2>/dev/null || true)"
+  for spec in "$@"; do
+    src="${spec#+}"; dst="${src#*:}"; src="${src%%:*}"
+    name="${dst#refs/heads/}"
+    if [ -z "$src" ] || [[ "$dst" != refs/heads/* ]] || [ -z "$(branch_owners "$name")" ]; then
+      normal+=("$spec"); continue
+    fi
+    [ "$src" = "$dst" ] || { results+=("error $dst push private branches under their own name"); continue; }
+    if ! readers_for_branch "$name" 2>/dev/null | grep -qxF -- "$me"; then
+      case "$(ask_private "$name")" in
+        n) normal+=("$spec"); continue ;;
+        e) ;;
+        *) results+=("error $dst not on the branch: rule for $name"); continue ;;
+      esac
+    fi
+    if (cmd_push_private "$name" "$remote") >&2; then
+      results+=("ok $dst")
+    else
+      results+=("error $dst push-private failed")
+    fi
+  done
+
+  if [ ${#normal[@]} -gt 0 ]; then
+    out="$(git push --porcelain "$url" "${normal[@]}")" || true
+    for spec in "${normal[@]}"; do
+      dst="${spec#*:}"
+      line="$(awk -F'\t' -v d=":$dst" 'substr($2, length($2) - length(d) + 1) == d {print; exit}' <<<"$out")"
+      flag="${line%%$'\t'*}"; summary="${line##*$'\t'}"
+      case "$flag" in
+        '') results+=("error $dst push failed") ;;
+        '!') results+=("error $dst $summary") ;;
+        *) results+=("ok $dst") ;;
+      esac
+    done
+  fi
+  for ref in "${results[@]}"; do echo "$ref"; done
+  echo
+}
+
+# you're pushing a private branch you aren't a reader of. no tty means no.
+ask_private() { # name
+  local ans
+  { : </dev/tty; } 2>/dev/null || return 0
+  printf 'git-orbis: you are not on the branch: rule for %s.\n  [e] encrypted push (adds you as a reader)\n  [n] normal push, plaintext, anyone can read it\n  [a] abort\nchoice [a]: ' "$1" >/dev/tty
+  read -r ans </dev/tty || true
+  echo "${ans:-a}"
+}
+
 case "${1:-}" in
   clean) shift; cmd_clean "$@" ;;
   smudge) shift; cmd_smudge "$@" ;;
@@ -414,5 +523,6 @@ case "${1:-}" in
   push-private) shift; cmd_push_private "$@" ;;
   fetch-private) shift; cmd_fetch_private "$@" ;;
   access) shift; cmd_access "$@" ;;
+  remote-helper) shift; cmd_remote_helper "$@" ;;
   *) sed -n '2,16p' "$0"; exit 1 ;;
 esac

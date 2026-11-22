@@ -1,0 +1,52 @@
+#compdef git-orbis
+# zsh completion for `git orbis`. zsh's _git calls _git-orbis on its own.
+
+local -a cmds
+cmds=(
+  'install:global filter + your identity'
+  'whoami:print your DID and teams'
+  'grant:add a reader or team member'
+  'access:set who reads a path or branch'
+  'sync:point .gitattributes at .orbis/access'
+  'refresh:decrypt again after getting access'
+  'init:filter + encrypted push for this clone'
+  'push-private:push a branch encrypted'
+  'fetch-private:decrypt a private branch'
+)
+
+if (( CURRENT == 2 )); then
+  _describe 'git orbis command' cmds
+  return
+fi
+
+local top; top="$(git rev-parse --show-toplevel 2>/dev/null)"
+
+# branches under refs matching a branch: rule, so only private ones show up
+_git_orbis_private() { # refs strip
+  local b pat
+  local -a pats out
+  pats=(${${(M)${(f)"$(<$top/.orbis/access)"}:#branch:*}%%[[:space:]]*})
+  pats=(${pats#branch:})
+  for b in ${(f)"$(git for-each-ref --format="%(refname:lstrip=$2)" $1 2>/dev/null)"}; do
+    for pat in $pats; do
+      [[ $b == ${~pat} ]] && { out+=($b); break }
+    done
+  done
+  compadd -a out
+}
+
+_git_orbis_teams() { # prefix
+  local -a teams
+  teams=(all ${(f)"$(awk -F: '/^[^#[:space:]][^:]*:/ {print $1}' $top/.orbis/teams 2>/dev/null)"})
+  compadd -- ${teams/#/$1}
+}
+
+case "$words[2]:$((CURRENT - 2))" in
+  push-private:1) _git_orbis_private refs/heads 2 ;;
+  fetch-private:1) _git_orbis_private refs/remotes/${words[4]:-origin} 3 ;;
+  push-private:2 | fetch-private:2) compadd -- ${(f)"$(git remote 2>/dev/null)"} ;;
+  push-private:3) compadd -- ${(f)"$(git for-each-ref --format='%(refname:short)' refs/remotes 2>/dev/null)"} ;;
+  grant:2) _git_orbis_teams ;;
+  access:1) _files ;;
+  access:*) _git_orbis_teams @ ;;
+esac
