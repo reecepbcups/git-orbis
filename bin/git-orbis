@@ -6,6 +6,7 @@
 #   git orbis install         once per machine: global filter + your identity
 #   git orbis whoami          print your DID, offers to create an identity
 #   git orbis grant <did> [team]  add a reader (or team member), grant what they can now read
+#   git orbis access <pattern> <owner>...  set who reads a path, or branch:<glob>
 #   git orbis sync            point .gitattributes at .orbis/access, re-grant every file
 #   git orbis refresh         decrypt again, e.g. after you got access
 #   git orbis init            filter for this clone only (instead of install)
@@ -285,6 +286,27 @@ cmd_grant() { # did [team]
   grant_files "$did"
 }
 
+# set the owners of one .orbis/access rule. same pattern again replaces it in
+# place, so last match wins ordering doesn't move.
+cmd_access() { # pattern owner...
+  local pat="${1:-}" f line tmp
+  [ -n "$pat" ] && [ $# -ge 2 ] || die "usage: git orbis access <pattern|branch:glob> <@team|did:key:...>..."
+  shift
+  owner_dids "$@" >/dev/null || exit 1
+  mkdir -p "$(top)/.orbis"
+  f="$(top)/.orbis/access"; tmp="$(mktemp)"
+  line="$pat  $*"
+  touch "$f"
+  awk -v p="$pat" -v l="$line" '
+    $1 == p { if (!done) print l; done = 1; next }
+    { print }
+    END { if (!done) print l }' "$f" >"$tmp"
+  cat "$tmp" >"$f"; rm -f "$tmp"
+  echo "$line"
+  # branch rules are read at push-private, file rules need the filter + grants
+  case "$pat" in branch:*) ;; *) cmd_sync ;; esac
+}
+
 # send every file through the filter so .orbis/access alone decides, then make
 # sure every reader has a grant
 cmd_sync() {
@@ -391,5 +413,6 @@ case "${1:-}" in
   sync) cmd_sync ;;
   push-private) shift; cmd_push_private "$@" ;;
   fetch-private) shift; cmd_fetch_private "$@" ;;
-  *) sed -n '2,15p' "$0"; exit 1 ;;
+  access) shift; cmd_access "$@" ;;
+  *) sed -n '2,16p' "$0"; exit 1 ;;
 esac

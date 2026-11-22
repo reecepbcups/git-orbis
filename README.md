@@ -103,6 +103,15 @@ Teams go in `.orbis/teams`. `@all` is the built-in team and it's just `.orbis/re
 ops: did:key:z6MkA... did:key:z6MkB...
 ```
 
+Or skip editing it by hand:
+
+```bash
+git orbis access .env.staging @ops           # file rule, runs sync for you
+git orbis access 'branch:private/*' @ops     # branch rule
+```
+
+Same pattern again replaces the old rule where it sits.
+
 After you edit `.orbis/access` run `git orbis sync`. It rewrites the git-orbis block in `.gitattributes` and grants the current version of every file to whoever can read it now.
 
 Giving someone access:
