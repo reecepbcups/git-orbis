@@ -1,5 +1,5 @@
 diff --git a/bin/cli-tool/src/commands/admin.rs b/bin/cli-tool/src/commands/admin.rs
-index e4a72fa..3e6c7b3 100644
+index e4a72fad..dfafe923 100644
 --- a/bin/cli-tool/src/commands/admin.rs
 +++ b/bin/cli-tool/src/commands/admin.rs
 @@ -15,6 +15,22 @@ use super::crypto::reader_did_from_seed;
@@ -25,10 +25,76 @@ index e4a72fa..3e6c7b3 100644
    - name: document
      relations:
        - name: creator
+@@ -164,6 +180,39 @@ async fn set_relationship_on_chain_impl(
+     Ok(())
+ }
+ 
++/// Grant `relation` to every DID in one transaction, optionally registering
++/// the object in the same transaction.
++#[allow(clippy::too_many_arguments)]
++pub async fn grant_batch(
++    policy_id: String,
++    object_id: String,
++    resource: String,
++    relation: String,
++    dids: Vec<String>,
++    register: bool,
++    config: ChainConfig,
++    signing_key_hex: &str,
++) -> Result<()> {
++    let client = signed_vera_client(config, signing_key_hex).await?;
++    let document = Object {
++        resource,
++        id: object_id,
++    };
++    let result = client
++        .acp_grant_batch(&policy_id, document, &relation, &dids, register)
++        .await
++        .map_err(|e| anyhow!("Failed to grant batch: {}", e))?;
++    println!(
++        "[ACP] grant_batch({} dids): code={} hash={} log={}",
++        dids.len(),
++        result.code,
++        result.tx_hash,
++        result.log
++    );
++    ensure_tx_success("Failed to grant batch", &result)?;
++    Ok(())
++}
++
+ pub async fn set_relationship_on_chain(
+     policy_id: String,
+     object_id: String,
+diff --git a/bin/cli-tool/src/lib.rs b/bin/cli-tool/src/lib.rs
+index 8a625155..403bb504 100644
+--- a/bin/cli-tool/src/lib.rs
++++ b/bin/cli-tool/src/lib.rs
+@@ -13,9 +13,9 @@ pub use commands::{
+     create_ring, derive_signer_did, do_dkg, do_encrypt_secret, do_pre, do_pre_and_save,
+     do_pre_with_inline_document, do_retrieve_pre, do_sign, do_store_secret, ensure_funded, fund,
+     fund_with_signer, generate_pet_tag, get_account_sequence, get_account_sequence_with_config,
+-    get_latest_ring, list_bulletin_posts, post_key_derivation, post_key_derivation_with_config,
+-    prepare_secret, prove_pet_tag_knowledge, query_node_info, query_pet_ring_state,
+-    query_ring_state, read_bulletin_post_with_config, reader_did_from_seed,
++    get_latest_ring, grant_batch, list_bulletin_posts, post_key_derivation,
++    post_key_derivation_with_config, prepare_secret, prove_pet_tag_knowledge, query_node_info,
++    query_pet_ring_state, query_ring_state, read_bulletin_post_with_config, reader_did_from_seed,
+     register_bulletin_namespace, register_object_to_chain, register_object_to_chain_with_config,
+     remove_node_from_whitelist, remove_node_from_whitelist_with_config,
+     schedule_ring_upgrade_by_acp, schedule_ring_upgrade_by_acp_with_config,
 diff --git a/bin/cli-tool/src/main.rs b/bin/cli-tool/src/main.rs
-index ab52f4e..74fce82 100644
+index ab52f4e4..0e402725 100644
 --- a/bin/cli-tool/src/main.rs
 +++ b/bin/cli-tool/src/main.rs
+@@ -7,7 +7,7 @@ pub use commands::{
+     add_bulletin_collaborator, add_node_to_whitelist, add_policy_to_chain,
+     cancel_ring_reshare_by_acp, cancel_ring_upgrade_by_acp, create_bulletin_post, create_ring,
+     derive_signer_did, do_dkg, do_encrypt_secret, do_pre, do_pre_and_save, do_retrieve_pre,
+-    do_sign, do_store_secret, fund_with_signer, get_account_sequence, get_latest_ring,
++    do_sign, do_store_secret, fund_with_signer, get_account_sequence, get_latest_ring, grant_batch,
+     list_bulletin_posts, post_key_derivation, prepare_secret, query_node_info,
+     query_pet_ring_state, query_ring_state, read_bulletin_post_with_config,
+     register_bulletin_namespace, register_object_to_chain, remove_node_from_whitelist,
 @@ -243,6 +243,11 @@ pub enum SubCommands {
      /// DID needs a relation granted (via `set-relationship-on-chain --actor-pubkey`)
      /// before such a transaction will be authorized.
@@ -41,17 +107,34 @@ index ab52f4e..74fce82 100644
      /// Add a policy to the chain
      AddPolicyToChain,
      /// Register object to the chain
-@@ -281,6 +286,9 @@ pub enum SubCommands {
+@@ -281,6 +286,26 @@ pub enum SubCommands {
          /// for ACP checks on signed transactions (see `derive-signer-did`).
          #[clap(long, conflicts_with = "reader_did_pk")]
          actor_pubkey: Option<String>,
 +        /// Grant this relation to an existing did:key directly, without its seed.
 +        #[clap(long, conflicts_with_all = ["reader_did_pk", "actor_pubkey"])]
 +        actor_did: Option<String>,
++    },
++    /// Grant a relation to several DIDs in one transaction
++    GrantBatch {
++        #[clap(long)]
++        policy_id: String,
++        #[clap(long)]
++        object_id: String,
++        #[clap(long)]
++        resource: String,
++        #[clap(long, default_value = "reader")]
++        relation: String,
++        /// Comma separated did:key list
++        #[clap(long, value_delimiter = ',')]
++        actor_dids: Vec<String>,
++        /// Register the object in the same transaction
++        #[clap(long)]
++        register: bool,
      },
      /// Register a bulletin namespace
      RegisterBulletinNamespace {
-@@ -721,6 +729,9 @@ async fn main() -> Result<()> {
+@@ -721,6 +746,9 @@ async fn main() -> Result<()> {
              )
              .await?;
          }
@@ -61,7 +144,7 @@ index ab52f4e..74fce82 100644
          SubCommands::DeriveSignerDid => {
              let signing_key = network.require_signing_key()?;
              let (public_key, did) = derive_signer_did(&signing_key, network.chain_config())?;
-@@ -754,9 +765,13 @@ async fn main() -> Result<()> {
+@@ -754,9 +782,13 @@ async fn main() -> Result<()> {
              relation,
              reader_did_pk,
              actor_pubkey,
@@ -76,3 +159,84 @@ index ab52f4e..74fce82 100644
              set_relationship_on_chain(
                  policy_id,
                  object_id,
+@@ -768,6 +800,27 @@ async fn main() -> Result<()> {
+             )
+             .await?;
+         }
++        SubCommands::GrantBatch {
++            policy_id,
++            object_id,
++            resource,
++            relation,
++            actor_dids,
++            register,
++        } => {
++            let signing_key = network.require_signing_key()?;
++            grant_batch(
++                policy_id,
++                object_id,
++                resource,
++                relation,
++                actor_dids,
++                register,
++                network.chain_config(),
++                &signing_key,
++            )
++            .await?;
++        }
+         SubCommands::RegisterBulletinNamespace { namespace } => {
+             let signing_key = network.require_signing_key()?;
+             register_bulletin_namespace(namespace, network.chain_config(), &signing_key).await?;
+diff --git a/crates/common/src/blockchain/cosmos/acp.rs b/crates/common/src/blockchain/cosmos/acp.rs
+index d6024156..8345c6ea 100644
+--- a/crates/common/src/blockchain/cosmos/acp.rs
++++ b/crates/common/src/blockchain/cosmos/acp.rs
+@@ -258,6 +258,48 @@ impl VeraGoClient {
+         .await
+     }
+ 
++    /// Grant `relation` on an object to each DID in one transaction, registering
++    /// the object first when `register` is set. One block instead of one per
++    /// message, and it rolls back as a whole.
++    pub async fn acp_grant_batch(
++        &self,
++        policy_id: &str,
++        object: Object,
++        relation: &str,
++        dids: &[String],
++        register: bool,
++    ) -> Result<BroadcastResult> {
++        let signer = self.require_signer()?;
++        let cmd = |kind| cosmrs::Any {
++            type_url: MsgDirectPolicyCmd::TYPE_URL.to_string(),
++            value: MsgDirectPolicyCmd {
++                creator: signer.address(),
++                policy_id: policy_id.to_string(),
++                cmd: Some(PolicyCmd { kind: Some(kind) }),
++            }
++            .encode_to_vec(),
++        };
++        let mut msgs = Vec::with_capacity(dids.len() + 1);
++        if register {
++            msgs.push(cmd(PolicyCmdKind::RegisterObjectCmd(RegisterObjectCmd {
++                object: Some(object.clone()),
++            })));
++        }
++        for did in dids {
++            msgs.push(cmd(PolicyCmdKind::SetRelationshipCmd(SetRelationshipCmd {
++                relationship: Some(Relationship {
++                    object: Some(object.clone()),
++                    relation: relation.to_string(),
++                    subject: Some(Subject {
++                        kind: Some(SubjectKind::Actor(Actor { id: did.clone() })),
++                    }),
++                }),
++            })));
++        }
++        self.broadcast_proto_msgs_with_gas(msgs, self.config().gas_multiplier)
++            .await
++    }
++
+     /// Delete a relationship from a policy.
+     pub async fn acp_delete_relationship(
+         &self,

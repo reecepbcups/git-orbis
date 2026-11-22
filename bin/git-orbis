@@ -132,19 +132,21 @@ grant_files() { # [did]
     is_pointer <<<"$ptr" || continue
     oid="$(sed -n 's/^object: //p' <<<"$ptr")"
     dids="$(readers_for "$path")" || exit 1
-    for did in $dids; do
-      [ -z "$only" ] || [ "$did" = "$only" ] || continue
-      grant "$oid" "$did"
-      echo "granted $did on $path"
-    done
+    [ -z "$only" ] || dids="$(grep -xF -- "$only" <<<"$dids" || true)"
+    [ -n "$dids" ] || continue
+    grant "$oid" $dids
+    for did in $dids; do echo "granted $did on $path"; done
   done < <(pointer_files)
 }
 
-grant() { # object_id did
-  # clap counts the env var as conflicting with --actor-did
-  ORBIS_READER_DID_PK= env -u ORBIS_READER_DID_PK "$ORBIS_CLI" set-relationship-on-chain --policy-id "$ORBIS_POLICY_ID" --object-id "$1" \
-    --resource document --relation reader --actor-did "$2" >/dev/null 2>&1 \
-    || die "grant $2 on $1 failed"
+# one tx for the whole list, one block no matter how many readers
+grant() { # [--register] object_id did...
+  local register=
+  if [ "$1" = --register ]; then register=--register; shift; fi
+  local oid="$1"; shift
+  local list; list="$(IFS=,; echo "$*")"
+  cli grant-batch --policy-id "$ORBIS_POLICY_ID" --object-id "$oid" --resource document \
+    --actor-dids "$list" $register >/dev/null 2>&1 || die "grant on $oid failed"
 }
 
 cmd_clean() { # path
@@ -170,11 +172,8 @@ cmd_clean() { # path
   oid="$(grep 'Object ID:' <<<"$out" | sed 's/.*Object ID: //')"
   [ -n "$oid" ] || die "no object id from store-secret"
 
-  cli register-object-to-chain --policy-id "$ORBIS_POLICY_ID" --object-id "$oid" \
-    --resource document >/dev/null 2>&1 || die "register object $oid failed"
-  grant "$oid" "$(whoami_did)"
-  local did
-  for did in $dids; do grant "$oid" "$did"; done
+  # register + every reader (you included) land in one block
+  grant --register "$oid" $(printf '%s\n' "$(whoami_did)" $dids | sort -u)
 
   printf '%s\nobject: %s\n' "$MAGIC" "$oid" | tee "$cached"
 }
