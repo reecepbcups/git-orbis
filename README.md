@@ -112,7 +112,7 @@ git orbis access 'branch:private/*' @ops     # branch rule
 
 Same pattern again replaces the old rule where it sits.
 
-After you edit `.orbis/access` run `git orbis sync`. It rewrites the git-orbis block in `.gitattributes` and grants the current version of every file to whoever can read it now.
+After you edit `.orbis/access` run `git orbis sync`. It rewrites the git-orbis block in `.gitattributes` and grants the current version of every file to whoever can read it now. Same for private branches on origin, and it turns on the `git push` encryption (see private branches below) if it's not on yet.
 
 Giving someone access:
 

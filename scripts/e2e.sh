@@ -140,6 +140,12 @@ as bob git push -q origin feat-bob </dev/null 2>/dev/null && fail "bob pushed fe
 git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -qa BOB_SECRET \
   && fail "feat-bob leaked" || ok "nothing from feat-bob on remote"
 
+echo "==> sync grants existing private branches to new readers"
+git orbis grant "$(did bob)" ops >/dev/null
+git orbis sync >/dev/null
+as bob git orbis fetch-private feat-x >/dev/null 2>&1 \
+  && ok "bob fetches feat-x after joining ops + sync" || fail "bob still locked out of feat-x"
+
 echo "==> alice publishes feat-x"
 cd "$W/alice"
 git orbis private-publish feat-x </dev/null 2>/dev/null && fail "published without confirm" || ok "private-publish needs a confirm"

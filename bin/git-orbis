@@ -22,6 +22,16 @@ MAGIC="orbis-git v1"
 
 die() { echo "git-orbis: $*" >&2; exit 1; }
 cli() { "$ORBIS_CLI" "$@"; }
+# every tx signs with one shared key, a parallel tx bumps the sequence under us
+cli_tx() {
+  local out i
+  for i in 1 2 3 4; do
+    out="$(cli "$@" 2>&1)" && { echo "$out"; return 0; }
+    grep -q 'account sequence mismatch' <<<"$out" || break
+    sleep $((i * 2))
+  done
+  echo "$out"; return 1
+}
 top() { git rev-parse --show-toplevel; }
 cache_dir() { local d; d="$(git rev-parse --git-dir)/orbis"; mkdir -p "$d"; echo "$d"; }
 
@@ -166,8 +176,10 @@ pointer_files() { git grep --cached -l -e "^$MAGIC\$" || [ $? -eq 1 ]; }
 
 # grant the current version of every filtered file to whoever may read it.
 # with a did, only that did.
-grant_files() { # [did]
-  local only="${1:-}" path ptr oid dids did
+# what grant_all should grant on every filtered file, one "oid<TAB>dids<TAB>label"
+# line each. with a did, only that did.
+file_grants() { # [did]
+  local only="${1:-}" path ptr oid dids
   cd "$(top)"
   while IFS= read -r path; do
     ptr="$(git show ":$path" 2>/dev/null)" || continue
@@ -176,9 +188,25 @@ grant_files() { # [did]
     dids="$(readers_for "$path")" || exit 1
     [ -z "$only" ] || dids="$(grep -xF -- "$only" <<<"$dids" || true)"
     [ -n "$dids" ] || continue
-    grant "$oid" $dids
-    for did in $dids; do echo "granted $did on $path"; done
+    printf '%s\t%s\t%s\n' "$oid" "$(paste -sd, - <<<"$dids")" "$path"
   done < <(pointer_files)
+}
+
+# every file and branch in one tx, so a sync costs one block
+grant_all() { # < file_grants/branch_grants lines
+  local oid dids label out
+  local -a args=() labels=()
+  while IFS=$'\t' read -r oid dids label; do
+    [ -n "$oid" ] || continue
+    args+=(--grants "$oid=$dids")
+    labels+=("$dids"$'\t'"$label")
+  done
+  [ ${#args[@]} -gt 0 ] || return 0
+  out="$(cli_tx grant-batch --policy-id "$ORBIS_POLICY_ID" --resource document "${args[@]}" 2>&1)" \
+    || die "grant failed: $(tail -3 <<<"$out")"
+  for label in "${labels[@]}"; do
+    for oid in $(tr , ' ' <<<"${label%%$'\t'*}"); do echo "granted $oid on ${label#*$'\t'}"; done
+  done
 }
 
 # one tx for the whole list, one block no matter how many readers
@@ -187,8 +215,9 @@ grant() { # [--register] object_id did...
   if [ "$1" = --register ]; then register=--register; shift; fi
   local oid="$1"; shift
   local list; list="$(IFS=,; echo "$*")"
-  cli grant-batch --policy-id "$ORBIS_POLICY_ID" --object-id "$oid" --resource document \
-    --actor-dids "$list" $register >/dev/null 2>&1 || die "grant on $oid failed"
+  local out
+  out="$(cli_tx grant-batch --policy-id "$ORBIS_POLICY_ID" --object-id "$oid" --resource document \
+    --actor-dids "$list" $register 2>&1)" || die "grant on $oid failed: $(tail -3 <<<"$out")"
 }
 
 cmd_clean() { # path
@@ -208,7 +237,7 @@ cmd_clean() { # path
   dids="$(readers_for "${1:-}")" || exit 1
   b64="$(base64 <"$tmp" | tr -d '\n')"
   # TODO: --secret is visible in ps on this machine. fine for a poc.
-  out="$(cli store-secret --secret "$b64" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
+  out="$(cli_tx store-secret --secret "$b64" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
     --policy-id "$ORBIS_POLICY_ID" --resource document --permission read --with-proof 2>&1)" \
     || die "store-secret failed: $out"
   oid="$(grep 'Object ID:' <<<"$out" | sed 's/.*Object ID: //')"
@@ -248,7 +277,7 @@ cmd_smudge() {
 whoami_did() { need_identity; cli reader-did | cut -d= -f2; }
 
 cmd_init() { # [--global]
-  local scope="${1:-}" proc="$ROOT/.tools/bin/orbis-filter" url
+  local scope="${1:-}" proc="$ROOT/.tools/bin/orbis-filter"
   [ -x "$proc" ] || die "missing $proc, run 'make filter'"
   # one long running process per git command, like git-lfs. clean/smudge stay
   # as the fallback for tools that don't speak the process protocol.
@@ -257,12 +286,35 @@ cmd_init() { # [--global]
   git config $scope filter.orbis.smudge "\"$HERE/git-orbis\" smudge %f"
   # if clean fails git must stop, never fall back to committing plaintext
   git config $scope filter.orbis.required true
-  # plain git push of a private branch goes through git-remote-orbis
-  if [ -z "$scope" ] && url="$(git remote get-url --push origin 2>/dev/null)" && [[ "$url" != orbis::* ]]; then
-    git config remote.origin.pushurl "orbis::$url"
-    echo "git push on origin now encrypts private branches"
-  fi
+  [ -n "$scope" ] || set_pushurl
   echo "git-orbis filter installed${scope:+ ($scope)}"
+}
+
+# plain git push of a private branch goes through git-remote-orbis
+set_pushurl() {
+  local url
+  url="$(git remote get-url --push origin 2>/dev/null)" || return 0
+  [[ "$url" != orbis::* ]] || return 0
+  git config remote.origin.pushurl "orbis::$url"
+  echo "git push on origin now encrypts private branches"
+}
+
+# grant every private branch on origin to whoever its branch: rule names now
+# same as file_grants, for every private branch on origin
+branch_grants() {
+  local ref name meta oid dids
+  git remote get-url origin >/dev/null 2>&1 || return 0
+  # fetch puts the stubs back, after a push the tracking ref holds real commits
+  git fetch -q origin || die "fetch origin failed"
+  while IFS= read -r ref; do
+    name="${ref#refs/remotes/origin/}"
+    [ -n "$(branch_owners "$name")" ] || continue
+    meta="$(git cat-file blob "$ref:.orbis/branches/$name" 2>/dev/null)" || continue
+    oid="$(sed -n 's/^object: //p' <<<"$meta")"
+    [ -n "$oid" ] || continue
+    dids="$(readers_for_branch "$name")" || exit 1
+    printf '%s\t%s\t%s\n' "$oid" "$(paste -sd, - <<<"$dids")" "branch $name"
+  done < <(git for-each-ref --format='%(refname)' refs/remotes/origin)
 }
 
 # one time per machine: global filter + identity, then plain clones just work
@@ -292,7 +344,7 @@ cmd_refresh() {
 }
 
 cmd_grant() { # did [team]
-  local did="${1:-}" name="${2:-}" f
+  local did="${1:-}" name="${2:-}" f list
   [[ "$did" == did:key:* ]] || die "usage: git orbis grant did:key:... [team]"
   load_config
   mkdir -p "$(top)/.orbis"
@@ -307,7 +359,8 @@ cmd_grant() { # did [team]
       echo "$name: $did" >>"$f"
     fi
   fi
-  grant_files "$did"
+  list="$(file_grants "$did")" || exit 1
+  grant_all <<<"$list"
 }
 
 # set the owners of one .orbis/access rule. same pattern again replaces it in
@@ -334,7 +387,7 @@ cmd_access() { # pattern owner...
 # send every file through the filter so .orbis/access alone decides, then make
 # sure every reader has a grant
 cmd_sync() {
-  local f tmp
+  local f tmp list
   [ -n "$(access_rules)" ] || die "no rules in .orbis/access"
   f="$(top)/.gitattributes"; tmp="$(mktemp)"
   # old per pattern lines are covered by *
@@ -348,7 +401,10 @@ cmd_sync() {
   cat "$tmp" >"$f"; rm -f "$tmp"
   echo "wrote .gitattributes"
   load_config
-  grant_files
+  set_pushurl
+  # collect first, a failed lookup must not leave half the grants sent
+  list="$(file_grants && branch_grants)" || exit 1
+  grant_all <<<"$list"
 }
 
 # the branch goes up as an encrypted git bundle on a branch with the same name,
@@ -376,7 +432,7 @@ cmd_push_private() { # branch [remote] [base]
 
   # sha256 rides along with the key so fetch can tell if the bundle was swapped
   b64="$(printf '%s %s' "$key" "$sum" | base64 | tr -d '\n')"
-  out="$(cli store-secret --secret "$b64" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
+  out="$(cli_tx store-secret --secret "$b64" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
     --policy-id "$ORBIS_POLICY_ID" --resource document --permission read --with-proof 2>&1)" \
     || die "store-secret failed: $out"
   oid="$(grep 'Object ID:' <<<"$out" | sed 's/.*Object ID: //')"
@@ -505,6 +561,7 @@ helper_push() { # remote url spec...
         *) results+=("error $dst not on the branch: rule for $name"); continue ;;
       esac
     fi
+    echo "git-orbis: $name is private ($(branch_owners "$name")), pushing encrypted" >&2
     if (cmd_push_private "$name" "$remote") >&2; then
       results+=("ok $dst")
     else
