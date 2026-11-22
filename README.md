@@ -33,7 +33,7 @@ git add .env
   -> clean filter
      1. store the file in orbis (encrypted to the ring's public key)
      2. register it as an object in the ACP policy
-     3. grant "reader" to you + every DID in .orbis/readers
+     3. grant "reader" to you + whoever .orbis/access says can read this path
      4. hand git the pointer (orbis-git v1 / object: <id>)
 
 git checkout / clone / pull
@@ -48,12 +48,13 @@ git checkout / clone / pull
 Few details that matter:
 
 - **Same content, same pointer.** Clean caches `sha256(plaintext) -> pointer` in `.git/orbis/`, and smudge fills that cache too. Without it every `git status` would think `.env` changed.
+- **One process, like git-lfs.** `.gitattributes` has `* filter=orbis`, so every file goes through the filter. `orbis-filter` (Go, in `cmd/orbis-filter`) is started once per git command and passes plain files straight back, so 5k files cost about 0.2s on top of plain git. Only files `.orbis/access` covers get handed to the `git-orbis` script.
 - **Fails closed.** `filter.orbis.required=true` means if clean can't reach orbis, git refuses to commit. It never falls back to committing plaintext.
-- **The repo files.** `.orbis/config` (ring id, ring public key, policy id) and `.orbis/readers` (one DID per line) get committed. Neither is secret, it's fine for them to be public.
+- **The repo files.** `.orbis/config` (ring id, ring public key, policy id), `.orbis/readers`, `.orbis/teams` and `.orbis/access` get committed. None of them are secret, it's fine for them to be public.
 
 ## Try it locally
 
-Needs docker and a rust toolchain (for `make tools`).
+Needs docker, a rust toolchain and go (for `make tools`). `make test` runs the go tests.
 
 ```bash
 make up      # vera + 3 orbis nodes in docker, project "git-orbis", ports 390xx
@@ -62,7 +63,7 @@ make e2e     # alice / bob / mallory / carol against a local bare "github" remot
 make down    # wipes the chain. pointers made against it are dead after this
 ```
 
-`make e2e` checks 13 things: nothing secret ever reaches the remote, readers decrypt, non-readers get the pointer, rotation, history and granting a new reader. Takes about a minute.
+`make e2e` checks 16 things: nothing secret ever reaches the remote, readers decrypt, non-readers get the pointer, per-file teams, rotation, history and adding someone to a team. Takes about a minute.
 
 Images are public and pinned by digest: `ghcr.io/sourcenetwork/orbis-rs` (jubjub build) and `ghcr.io/sourcenetwork/vera` (the `:dev` build from 2026-11-12).
 
@@ -82,14 +83,33 @@ Adding it to a repo:
 ```bash
 mkdir -p .orbis && cp ~/git-orbis/.orbis-ring.env .orbis/config
 git orbis whoami > .orbis/readers
-echo '.env filter=orbis' >> .gitattributes
+echo '.env* @all' > .orbis/access
+git orbis sync     # writes the filter lines into .gitattributes
 git add -A && git commit -m "encrypted env"
 ```
+
+### Who can read what
+
+`.orbis/access` works like CODEOWNERS. A pattern, then who can read it. Last match wins.
+
+```text
+.env*             @all
+.env.production   @ops did:key:z6MkExtra...
+```
+
+Teams go in `.orbis/teams`. `@all` is the built-in team and it's just `.orbis/readers`, so older repos keep working without an access file.
+
+```text
+ops: did:key:z6MkA... did:key:z6MkB...
+```
+
+After you edit `.orbis/access` run `git orbis sync`. It rewrites the git-orbis block in `.gitattributes` and grants the current version of every file to whoever can read it now.
 
 Giving someone access:
 
 ```bash
-git orbis grant did:key:z6Mk...
+git orbis grant did:key:z6Mk...        # adds to @all
+git orbis grant did:key:z6Mk... ops    # adds to the ops team
 git commit -am "give <name> access" && git push
 ```
 
@@ -100,6 +120,8 @@ Your identity seed lives in `~/.ssh/git-orbis` (0600). `ORBIS_READER_DID_PK` ove
 It's a POC, so:
 
 - **Single machine.** The stack is on localhost, so only this machine can decrypt. A real team needs the nodes + chain hosted somewhere they can all reach.
+- **Teams are read only.** They control who can decrypt, not who can change a file. Anyone who can push can commit a new `.env` or edit `.orbis/access`. Use GitHub CODEOWNERS + branch protection on `.orbis/` and the secret files for that.
+- **Forget `sync`, leak plaintext.** A new pattern in `.orbis/access` isn't encrypted until `git orbis sync` puts it in `.gitattributes`.
 - **No revoke.** Removing a reader doesn't take anything back. Rotate the actual secret (true for every git secret tool, old versions live in history).
 - **Slow-ish commits.** A changed `.env` costs ~20s (1 store + 1 register + 1 grant per reader, each waits for a block). Unchanged files are instant. Batching the grants into one tx would get it to ~8s.
 - **`ps` can see it.** The secret goes to `cli-tool` as `--secret` while committing.
