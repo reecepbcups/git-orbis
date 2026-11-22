@@ -1,5 +1,5 @@
 diff --git a/bin/cli-tool/src/commands/admin.rs b/bin/cli-tool/src/commands/admin.rs
-index e4a72fad..dfafe923 100644
+index e4a72fad..ae65aafa 100644
 --- a/bin/cli-tool/src/commands/admin.rs
 +++ b/bin/cli-tool/src/commands/admin.rs
 @@ -15,6 +15,22 @@ use super::crypto::reader_did_from_seed;
@@ -25,35 +25,41 @@ index e4a72fad..dfafe923 100644
    - name: document
      relations:
        - name: creator
-@@ -164,6 +180,39 @@ async fn set_relationship_on_chain_impl(
+@@ -164,6 +180,45 @@ async fn set_relationship_on_chain_impl(
      Ok(())
  }
  
-+/// Grant `relation` to every DID in one transaction, optionally registering
-+/// the object in the same transaction.
-+#[allow(clippy::too_many_arguments)]
++/// Grant `relation` on each object to its DIDs in one transaction, optionally
++/// registering the objects in the same transaction.
 +pub async fn grant_batch(
 +    policy_id: String,
-+    object_id: String,
 +    resource: String,
 +    relation: String,
-+    dids: Vec<String>,
++    grants: Vec<(String, Vec<String>)>,
 +    register: bool,
 +    config: ChainConfig,
 +    signing_key_hex: &str,
 +) -> Result<()> {
 +    let client = signed_vera_client(config, signing_key_hex).await?;
-+    let document = Object {
-+        resource,
-+        id: object_id,
-+    };
++    let grants: Vec<(Object, Vec<String>)> = grants
++        .into_iter()
++        .map(|(id, dids)| {
++            (
++                Object {
++                    resource: resource.clone(),
++                    id,
++                },
++                dids,
++            )
++        })
++        .collect();
 +    let result = client
-+        .acp_grant_batch(&policy_id, document, &relation, &dids, register)
++        .acp_grant_batch(&policy_id, &grants, &relation, register)
 +        .await
 +        .map_err(|e| anyhow!("Failed to grant batch: {}", e))?;
 +    println!(
-+        "[ACP] grant_batch({} dids): code={} hash={} log={}",
-+        dids.len(),
++        "[ACP] grant_batch({} objects): code={} hash={} log={}",
++        grants.len(),
 +        result.code,
 +        result.tx_hash,
 +        result.log
@@ -83,7 +89,7 @@ index 8a625155..403bb504 100644
      remove_node_from_whitelist, remove_node_from_whitelist_with_config,
      schedule_ring_upgrade_by_acp, schedule_ring_upgrade_by_acp_with_config,
 diff --git a/bin/cli-tool/src/main.rs b/bin/cli-tool/src/main.rs
-index ab52f4e4..0e402725 100644
+index ab52f4e4..b0e5f572 100644
 --- a/bin/cli-tool/src/main.rs
 +++ b/bin/cli-tool/src/main.rs
 @@ -7,7 +7,7 @@ pub use commands::{
@@ -107,7 +113,7 @@ index ab52f4e4..0e402725 100644
      /// Add a policy to the chain
      AddPolicyToChain,
      /// Register object to the chain
-@@ -281,6 +286,26 @@ pub enum SubCommands {
+@@ -281,6 +286,29 @@ pub enum SubCommands {
          /// for ACP checks on signed transactions (see `derive-signer-did`).
          #[clap(long, conflicts_with = "reader_did_pk")]
          actor_pubkey: Option<String>,
@@ -119,8 +125,8 @@ index ab52f4e4..0e402725 100644
 +    GrantBatch {
 +        #[clap(long)]
 +        policy_id: String,
-+        #[clap(long)]
-+        object_id: String,
++        #[clap(long, required_unless_present = "grants")]
++        object_id: Option<String>,
 +        #[clap(long)]
 +        resource: String,
 +        #[clap(long, default_value = "reader")]
@@ -131,10 +137,13 @@ index ab52f4e4..0e402725 100644
 +        /// Register the object in the same transaction
 +        #[clap(long)]
 +        register: bool,
++        /// More objects in the same transaction, each `<object-id>=<did>,<did>`
++        #[clap(long, conflicts_with_all = ["object_id", "actor_dids"])]
++        grants: Vec<String>,
      },
      /// Register a bulletin namespace
      RegisterBulletinNamespace {
-@@ -721,6 +746,9 @@ async fn main() -> Result<()> {
+@@ -721,6 +749,9 @@ async fn main() -> Result<()> {
              )
              .await?;
          }
@@ -144,7 +153,7 @@ index ab52f4e4..0e402725 100644
          SubCommands::DeriveSignerDid => {
              let signing_key = network.require_signing_key()?;
              let (public_key, did) = derive_signer_did(&signing_key, network.chain_config())?;
-@@ -754,9 +782,13 @@ async fn main() -> Result<()> {
+@@ -754,9 +785,13 @@ async fn main() -> Result<()> {
              relation,
              reader_did_pk,
              actor_pubkey,
@@ -159,7 +168,7 @@ index ab52f4e4..0e402725 100644
              set_relationship_on_chain(
                  policy_id,
                  object_id,
-@@ -768,6 +800,27 @@ async fn main() -> Result<()> {
+@@ -768,6 +803,39 @@ async fn main() -> Result<()> {
              )
              .await?;
          }
@@ -170,14 +179,26 @@ index ab52f4e4..0e402725 100644
 +            relation,
 +            actor_dids,
 +            register,
++            grants,
 +        } => {
 +            let signing_key = network.require_signing_key()?;
++            let grants = match object_id {
++                Some(id) => vec![(id, actor_dids)],
++                None => grants
++                    .iter()
++                    .map(|g| {
++                        let (id, dids) = g.split_once('=').ok_or_else(|| {
++                            anyhow::anyhow!("bad --grants {g}, want <object-id>=<did>,<did>")
++                        })?;
++                        Ok((id.to_string(), dids.split(',').map(str::to_string).collect()))
++                    })
++                    .collect::<Result<Vec<_>>>()?,
++            };
 +            grant_batch(
 +                policy_id,
-+                object_id,
 +                resource,
 +                relation,
-+                actor_dids,
++                grants,
 +                register,
 +                network.chain_config(),
 +                &signing_key,
@@ -188,22 +209,21 @@ index ab52f4e4..0e402725 100644
              let signing_key = network.require_signing_key()?;
              register_bulletin_namespace(namespace, network.chain_config(), &signing_key).await?;
 diff --git a/crates/common/src/blockchain/cosmos/acp.rs b/crates/common/src/blockchain/cosmos/acp.rs
-index d6024156..8345c6ea 100644
+index d6024156..b289bbb7 100644
 --- a/crates/common/src/blockchain/cosmos/acp.rs
 +++ b/crates/common/src/blockchain/cosmos/acp.rs
-@@ -258,6 +258,48 @@ impl VeraGoClient {
+@@ -258,6 +258,49 @@ impl VeraGoClient {
          .await
      }
  
-+    /// Grant `relation` on an object to each DID in one transaction, registering
-+    /// the object first when `register` is set. One block instead of one per
++    /// Grant `relation` on each object to its DIDs in one transaction, registering
++    /// the objects first when `register` is set. One block instead of one per
 +    /// message, and it rolls back as a whole.
 +    pub async fn acp_grant_batch(
 +        &self,
 +        policy_id: &str,
-+        object: Object,
++        grants: &[(Object, Vec<String>)],
 +        relation: &str,
-+        dids: &[String],
 +        register: bool,
 +    ) -> Result<BroadcastResult> {
 +        let signer = self.require_signer()?;
@@ -216,7 +236,8 @@ index d6024156..8345c6ea 100644
 +            }
 +            .encode_to_vec(),
 +        };
-+        let mut msgs = Vec::with_capacity(dids.len() + 1);
++        let mut msgs = Vec::new();
++        for (object, dids) in grants {
 +        if register {
 +            msgs.push(cmd(PolicyCmdKind::RegisterObjectCmd(RegisterObjectCmd {
 +                object: Some(object.clone()),
@@ -232,6 +253,7 @@ index d6024156..8345c6ea 100644
 +                    }),
 +                }),
 +            })));
++        }
 +        }
 +        self.broadcast_proto_msgs_with_gas(msgs, self.config().gas_multiplier)
 +            .await

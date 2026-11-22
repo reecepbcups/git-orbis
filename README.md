@@ -63,7 +63,7 @@ make e2e     # alice / bob / mallory / carol against a local bare "github" remot
 make down    # wipes the chain. pointers made against it are dead after this
 ```
 
-`make e2e` checks 16 things: nothing secret ever reaches the remote, readers decrypt, non-readers get the pointer, per-file teams, rotation, history and adding someone to a team. Takes about a minute.
+`make e2e` checks 22 things: nothing secret ever reaches the remote, readers decrypt, non-readers get the pointer, per-file teams, rotation, history, adding someone to a team and private branches. Takes about a minute.
 
 Images are public and pinned by digest: `ghcr.io/sourcenetwork/orbis-rs` (jubjub build) and `ghcr.io/sourcenetwork/vera` (the `:dev` build from 2026-11-12).
 
@@ -73,7 +73,7 @@ Once per machine:
 
 ```bash
 export PATH="$HOME/git-orbis/bin:$PATH"   # put it in your shell rc
-git orbis install                             # global filter + creates ~/.ssh/git-orbis, prints your DID
+git orbis install                             # global filter, zsh completion, creates ~/.ssh/git-orbis, prints your DID
 ```
 
 After that a plain `git clone` of a repo using git-orbis decrypts on its own. If you got access after cloning, `git orbis refresh`.
@@ -103,7 +103,16 @@ Teams go in `.orbis/teams`. `@all` is the built-in team and it's just `.orbis/re
 ops: did:key:z6MkA... did:key:z6MkB...
 ```
 
-After you edit `.orbis/access` run `git orbis sync`. It rewrites the git-orbis block in `.gitattributes` and grants the current version of every file to whoever can read it now.
+Or skip editing it by hand:
+
+```bash
+git orbis access .env.staging @ops           # file rule, runs sync for you
+git orbis access 'branch:private/*' @ops     # branch rule
+```
+
+Same pattern again replaces the old rule where it sits.
+
+After you edit `.orbis/access` run `git orbis sync`. It rewrites the git-orbis block in `.gitattributes` and grants the current version of every file to whoever can read it now. Same for private branches on origin, and it turns on the `git push` encryption (see private branches below) if it's not on yet.
 
 Giving someone access:
 
@@ -112,6 +121,38 @@ git orbis grant did:key:z6Mk...        # adds to @all
 git orbis grant did:key:z6Mk... ops    # adds to the ops team
 git commit -am "give <name> access" && git push
 ```
+
+### Private branches
+
+A whole branch can be private too. Add a `branch:` rule to `.orbis/access` (glob, last match wins, same owners as files):
+
+```text
+branch:feat-*   @ops
+```
+
+```bash
+git orbis push-private feat-x            # [remote] [base], defaults origin origin/main
+git orbis fetch-private feat-x           # readers get a real local feat-x
+```
+
+GitHub gets a branch called `feat-x`, so everyone can see it's there. It's just `origin/main` plus two files:
+
+- `.orbis/branches/feat-x` - the orbis object id and the base commit
+- `.orbis/branches/feat-x.bundle` - the branch as a `git bundle`, AES-256 encrypted
+
+The AES key (and the bundle's sha256) is the orbis secret, so only DIDs on the rule can decrypt it. Code, file names, commit messages and authors stay hidden. The branch name, its size and when you pushed don't.
+
+No matching `branch:` rule means push-private refuses, it won't fall back to `@all`.
+
+You don't have to remember push-private either. Run `git orbis init` once in the clone and plain `git push` does it for you. It sets origin's pushurl to `orbis::<url>`, so pushes go through `git-remote-orbis`:
+
+- branch matches a `branch:` rule and you're on it - encrypted push
+- matches but you're not on it - it asks: encrypted, plaintext or abort. no terminal means abort
+- anything else - normal push
+
+Done hiding it? `git orbis private-publish feat-x launch` renames it to a public name, pushes the real commits and deletes the encrypted copy. It asks you to type `yes` first (`--yes` skips that), since there's no taking it back.
+
+Tab completion (zsh) comes with `git orbis install`. It links into `~/.oh-my-zsh/custom/completions`, no `.zshrc` edit. Without oh-my-zsh, add `~/git-orbis/completions` to your `fpath`.
 
 Your identity seed lives in `~/.ssh/git-orbis` (0600). `ORBIS_READER_DID_PK` overrides it, `ORBIS_IDENTITY_FILE` moves it. `git orbis init` sets the filter for one clone only if you'd rather not touch your global config.
 
@@ -124,6 +165,8 @@ It's a POC, so:
 - **Forget `sync`, leak plaintext.** A new pattern in `.orbis/access` isn't encrypted until `git orbis sync` puts it in `.gitattributes`.
 - **No revoke.** Removing a reader doesn't take anything back. Rotate the actual secret (true for every git secret tool, old versions live in history).
 - **Slow-ish commits.** A changed secret costs ~7s: 1 block to store it, 1 block to register it and grant every reader in one tx. Unchanged files are instant. Blocks are 5s on the localnet, so that's most of it.
+- **Plain `git push` only encrypts after `git orbis init`.** A clone without the orbis pushurl pushes private branches in plaintext.
+- **Private branches are last push wins.** Every `push-private` force pushes a full new bundle. Two people pushing the same one clobber each other. No PR diff view on GitHub either, merging means pushing the code to main for real.
 - **`ps` can see it.** The secret goes to `cli-tool` as `--secret` while committing.
 - **Shared writer key.** Everyone writes with the public devnet key, which owns the ACP objects.
 - **Seeds are toy strings** in the demo. Use random ones.

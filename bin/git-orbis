@@ -6,9 +6,13 @@
 #   git orbis install         once per machine: global filter + your identity
 #   git orbis whoami          print your DID, offers to create an identity
 #   git orbis grant <did> [team]  add a reader (or team member), grant what they can now read
+#   git orbis access <pattern> <owner>...  set who reads a path, or branch:<glob>
 #   git orbis sync            point .gitattributes at .orbis/access, re-grant every file
 #   git orbis refresh         decrypt again, e.g. after you got access
 #   git orbis init            filter for this clone only (instead of install)
+#   git orbis push-private <branch> [remote] [base]  push branch encrypted, see branch: rules
+#   git orbis fetch-private <branch> [remote]        decrypt it into a local branch
+#   git orbis private-publish [--yes] <branch> <new-name> [remote]  make it public for good
 #   git orbis clean|smudge    called by git, not you
 set -euo pipefail
 
@@ -18,6 +22,16 @@ MAGIC="orbis-git v1"
 
 die() { echo "git-orbis: $*" >&2; exit 1; }
 cli() { "$ORBIS_CLI" "$@"; }
+# every tx signs with one shared key, a parallel tx bumps the sequence under us
+cli_tx() {
+  local out i
+  for i in 1 2 3 4; do
+    out="$(cli "$@" 2>&1)" && { echo "$out"; return 0; }
+    grep -q 'account sequence mismatch' <<<"$out" || break
+    sleep $((i * 2))
+  done
+  echo "$out"; return 1
+}
 top() { git rev-parse --show-toplevel; }
 cache_dir() { local d; d="$(git rev-parse --git-dir)/orbis"; mkdir -p "$d"; echo "$d"; }
 
@@ -56,8 +70,19 @@ create_identity() {
 }
 
 cmd_whoami() {
+  local did teams
   [ -n "${ORBIS_READER_DID_PK:-}" ] || create_identity
-  whoami_did
+  did="$(whoami_did)"
+  echo "$did"
+  git rev-parse --show-toplevel >/dev/null 2>&1 || return 0
+  teams="$({
+    readers | grep -qxF -- "$did" && echo @all
+    repo_file .orbis/teams | grep -v '^[[:space:]]*#' \
+      | awk -v d="$did" '{for (i = 2; i <= NF; i++) if ($i == d) { sub(":$", "", $1); print "@" $1 }}'
+  } | tr '\n' ' ')"
+  # stderr so `git orbis whoami > .orbis/readers` still works
+  teams="${teams% }"
+  echo "teams: ${teams:-none}" >&2
 }
 
 readers() { grep -v '^#' "$(top)/.orbis/readers" 2>/dev/null | awk 'NF{print $1}'; }
@@ -69,7 +94,9 @@ repo_file() {
   git show ":$1" 2>/dev/null || git show "HEAD:$1" 2>/dev/null || true
 }
 
-access_rules() { repo_file .orbis/access | grep -v '^[[:space:]]*#' | awk 'NF' || true; }
+# branch: rules are for private branches, never files
+access_rules() { repo_file .orbis/access | grep -v '^[[:space:]]*#' | awk 'NF && $1 !~ /^branch:/' || true; }
+branch_rules() { repo_file .orbis/access | awk '$1 ~ /^branch:/' || true; }
 
 # @all is .orbis/readers so repos from before teams keep working
 team() { # name
@@ -105,12 +132,17 @@ protected() { # path
 
 # DIDs that may read path
 readers_for() { # path
-  local n owner
+  local n
   [ -n "$1" ] || { readers; return; }
   n="$(rule_for "$1")"
   # not in .orbis/access, fall back to @all
   [ -n "$n" ] || { readers; return; }
-  for owner in $(access_rules | sed -n "${n}p" | awk '{$1 = ""; print}'); do
+  owner_dids $(access_rules | sed -n "${n}p" | awk '{$1 = ""; print}')
+}
+
+owner_dids() { # owner...
+  local owner
+  for owner in "$@"; do
     case "$owner" in
       @*) team "${owner#@}" ;;
       did:key:*) echo "$owner" ;;
@@ -119,13 +151,35 @@ readers_for() { # path
   done | sort -u
 }
 
+# DIDs that may read a private branch. last matching branch: rule wins.
+# no rule fails closed, a private branch shouldn't fall back to @all.
+readers_for_branch() { # name
+  local owners
+  owners="$(branch_owners "$1")"
+  [ -n "$owners" ] || die "no branch: rule in .orbis/access matches $1"
+  owner_dids $owners
+}
+
+# owners column of the last branch: rule matching name, empty if none
+branch_owners() { # name
+  local pat owners= rest
+  while read -r pat rest; do
+    pat="${pat#branch:}"
+    # shellcheck disable=SC2053 # pat is a glob on purpose
+    if [[ "$1" == $pat ]]; then owners="$rest"; fi
+  done < <(branch_rules)
+  echo "$owners"
+}
+
 # files git stores as pointers. run from the top.
 pointer_files() { git grep --cached -l -e "^$MAGIC\$" || [ $? -eq 1 ]; }
 
 # grant the current version of every filtered file to whoever may read it.
 # with a did, only that did.
-grant_files() { # [did]
-  local only="${1:-}" path ptr oid dids did
+# what grant_all should grant on every filtered file, one "oid<TAB>dids<TAB>label"
+# line each. with a did, only that did.
+file_grants() { # [did]
+  local only="${1:-}" path ptr oid dids
   cd "$(top)"
   while IFS= read -r path; do
     ptr="$(git show ":$path" 2>/dev/null)" || continue
@@ -134,9 +188,25 @@ grant_files() { # [did]
     dids="$(readers_for "$path")" || exit 1
     [ -z "$only" ] || dids="$(grep -xF -- "$only" <<<"$dids" || true)"
     [ -n "$dids" ] || continue
-    grant "$oid" $dids
-    for did in $dids; do echo "granted $did on $path"; done
+    printf '%s\t%s\t%s\n' "$oid" "$(paste -sd, - <<<"$dids")" "$path"
   done < <(pointer_files)
+}
+
+# every file and branch in one tx, so a sync costs one block
+grant_all() { # < file_grants/branch_grants lines
+  local oid dids label out
+  local -a args=() labels=()
+  while IFS=$'\t' read -r oid dids label; do
+    [ -n "$oid" ] || continue
+    args+=(--grants "$oid=$dids")
+    labels+=("$dids"$'\t'"$label")
+  done
+  [ ${#args[@]} -gt 0 ] || return 0
+  out="$(cli_tx grant-batch --policy-id "$ORBIS_POLICY_ID" --resource document "${args[@]}" 2>&1)" \
+    || die "grant failed: $(tail -3 <<<"$out")"
+  for label in "${labels[@]}"; do
+    for oid in $(tr , ' ' <<<"${label%%$'\t'*}"); do echo "granted $oid on ${label#*$'\t'}"; done
+  done
 }
 
 # one tx for the whole list, one block no matter how many readers
@@ -145,8 +215,9 @@ grant() { # [--register] object_id did...
   if [ "$1" = --register ]; then register=--register; shift; fi
   local oid="$1"; shift
   local list; list="$(IFS=,; echo "$*")"
-  cli grant-batch --policy-id "$ORBIS_POLICY_ID" --object-id "$oid" --resource document \
-    --actor-dids "$list" $register >/dev/null 2>&1 || die "grant on $oid failed"
+  local out
+  out="$(cli_tx grant-batch --policy-id "$ORBIS_POLICY_ID" --object-id "$oid" --resource document \
+    --actor-dids "$list" $register 2>&1)" || die "grant on $oid failed: $(tail -3 <<<"$out")"
 }
 
 cmd_clean() { # path
@@ -166,7 +237,7 @@ cmd_clean() { # path
   dids="$(readers_for "${1:-}")" || exit 1
   b64="$(base64 <"$tmp" | tr -d '\n')"
   # TODO: --secret is visible in ps on this machine. fine for a poc.
-  out="$(cli store-secret --secret "$b64" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
+  out="$(cli_tx store-secret --secret "$b64" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
     --policy-id "$ORBIS_POLICY_ID" --resource document --permission read --with-proof 2>&1)" \
     || die "store-secret failed: $out"
   oid="$(grep 'Object ID:' <<<"$out" | sed 's/.*Object ID: //')"
@@ -215,13 +286,52 @@ cmd_init() { # [--global]
   git config $scope filter.orbis.smudge "\"$HERE/git-orbis\" smudge %f"
   # if clean fails git must stop, never fall back to committing plaintext
   git config $scope filter.orbis.required true
+  [ -n "$scope" ] || set_pushurl
   echo "git-orbis filter installed${scope:+ ($scope)}"
+}
+
+# plain git push of a private branch goes through git-remote-orbis
+set_pushurl() {
+  local url
+  url="$(git remote get-url --push origin 2>/dev/null)" || return 0
+  [[ "$url" != orbis::* ]] || return 0
+  git config remote.origin.pushurl "orbis::$url"
+  echo "git push on origin now encrypts private branches"
+}
+
+# grant every private branch on origin to whoever its branch: rule names now
+# same as file_grants, for every private branch on origin
+branch_grants() {
+  local ref name meta oid dids
+  git remote get-url origin >/dev/null 2>&1 || return 0
+  # fetch puts the stubs back, after a push the tracking ref holds real commits
+  git fetch -q origin || die "fetch origin failed"
+  while IFS= read -r ref; do
+    name="${ref#refs/remotes/origin/}"
+    [ -n "$(branch_owners "$name")" ] || continue
+    meta="$(git cat-file blob "$ref:.orbis/branches/$name" 2>/dev/null)" || continue
+    oid="$(sed -n 's/^object: //p' <<<"$meta")"
+    [ -n "$oid" ] || continue
+    dids="$(readers_for_branch "$name")" || exit 1
+    printf '%s\t%s\t%s\n' "$oid" "$(paste -sd, - <<<"$dids")" "branch $name"
+  done < <(git for-each-ref --format='%(refname)' refs/remotes/origin)
 }
 
 # one time per machine: global filter + identity, then plain clones just work
 cmd_install() {
   cmd_init --global
+  install_completion
   cmd_whoami
+}
+
+# oh-my-zsh already has custom/completions on fpath, so no .zshrc edit
+install_completion() {
+  local d="$HOME/.oh-my-zsh/custom/completions"
+  [ -d "$HOME/.oh-my-zsh" ] || { echo "zsh completion: add $ROOT/completions to your fpath"; return; }
+  mkdir -p "$d" && ln -sf "$ROOT/completions/_git-orbis" "$d/_git-orbis"
+  # zsh caches completions, a stale dump hides the new one
+  rm -f "$HOME"/.zcompdump*
+  echo "zsh completion linked, open a new terminal"
 }
 
 # re-run the decrypt, e.g. after someone granted you access
@@ -234,7 +344,7 @@ cmd_refresh() {
 }
 
 cmd_grant() { # did [team]
-  local did="${1:-}" name="${2:-}" f
+  local did="${1:-}" name="${2:-}" f list
   [[ "$did" == did:key:* ]] || die "usage: git orbis grant did:key:... [team]"
   load_config
   mkdir -p "$(top)/.orbis"
@@ -249,13 +359,35 @@ cmd_grant() { # did [team]
       echo "$name: $did" >>"$f"
     fi
   fi
-  grant_files "$did"
+  list="$(file_grants "$did")" || exit 1
+  grant_all <<<"$list"
+}
+
+# set the owners of one .orbis/access rule. same pattern again replaces it in
+# place, so last match wins ordering doesn't move.
+cmd_access() { # pattern owner...
+  local pat="${1:-}" f line tmp
+  [ -n "$pat" ] && [ $# -ge 2 ] || die "usage: git orbis access <pattern|branch:glob> <@team|did:key:...>..."
+  shift
+  owner_dids "$@" >/dev/null || exit 1
+  mkdir -p "$(top)/.orbis"
+  f="$(top)/.orbis/access"; tmp="$(mktemp)"
+  line="$pat  $*"
+  touch "$f"
+  awk -v p="$pat" -v l="$line" '
+    $1 == p { if (!done) print l; done = 1; next }
+    { print }
+    END { if (!done) print l }' "$f" >"$tmp"
+  cat "$tmp" >"$f"; rm -f "$tmp"
+  echo "$line"
+  # branch rules are read at push-private, file rules need the filter + grants
+  case "$pat" in branch:*) ;; *) cmd_sync ;; esac
 }
 
 # send every file through the filter so .orbis/access alone decides, then make
 # sure every reader has a grant
 cmd_sync() {
-  local f tmp
+  local f tmp list
   [ -n "$(access_rules)" ] || die "no rules in .orbis/access"
   f="$(top)/.gitattributes"; tmp="$(mktemp)"
   # old per pattern lines are covered by *
@@ -269,7 +401,198 @@ cmd_sync() {
   cat "$tmp" >"$f"; rm -f "$tmp"
   echo "wrote .gitattributes"
   load_config
-  grant_files
+  set_pushurl
+  # collect first, a failed lookup must not leave half the grants sent
+  list="$(file_grants && branch_grants)" || exit 1
+  grant_all <<<"$list"
+}
+
+# the branch goes up as an encrypted git bundle on a branch with the same name,
+# on top of the public base. others see it exists, never the code.
+# only the aes key lives in orbis, the bundle is too big for --secret.
+cmd_push_private() { # branch [remote] [base]
+  local name="${1:-}" remote="${2:-origin}" base="${3:-}" b dids tmp key sum b64 out oid meta blob tree commit url
+  [ -n "$name" ] || die "usage: git orbis push-private <branch> [remote] [base]"
+  git rev-parse -q --verify "refs/heads/$name" >/dev/null || die "no local branch $name"
+  load_config; need_identity
+  dids="$(readers_for_branch "$name")" || exit 1
+  # base has to be on the remote already, the stub commit makes it public
+  base="${base:-$remote/main}"
+  git fetch -q "$remote" || die "fetch $remote failed"
+  b="$(git merge-base "$base" "refs/heads/$name")" || die "$name has no history in common with $base"
+  [ "$b" != "$(git rev-parse "refs/heads/$name")" ] || die "$name has nothing past $base"
+
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  git bundle create -q "$tmp/bundle" "refs/heads/$name" "^$b" || die "bundle failed"
+  key="$(openssl rand -hex 32)"
+  sum="$(shasum -a 256 <"$tmp/bundle" | cut -d' ' -f1)"
+  # key over fd so it stays out of ps
+  openssl enc -aes-256-cbc -pbkdf2 -salt -pass fd:3 -in "$tmp/bundle" -out "$tmp/enc" 3<<<"$key" \
+    || die "encrypt failed"
+
+  # sha256 rides along with the key so fetch can tell if the bundle was swapped
+  b64="$(printf '%s %s' "$key" "$sum" | base64 | tr -d '\n')"
+  out="$(cli_tx store-secret --secret "$b64" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
+    --policy-id "$ORBIS_POLICY_ID" --resource document --permission read --with-proof 2>&1)" \
+    || die "store-secret failed: $out"
+  oid="$(grep 'Object ID:' <<<"$out" | sed 's/.*Object ID: //')"
+  [ -n "$oid" ] || die "no object id from store-secret"
+  grant --register "$oid" $(printf '%s\n' "$(whoami_did)" $dids | sort -u)
+
+  # plumbing only, so no filter and no worktree touched
+  meta="$(printf 'orbis-branch v1\nobject: %s\nbase: %s\n' "$oid" "$b" | git hash-object -w --stdin --no-filters)"
+  blob="$(git hash-object -w --no-filters "$tmp/enc")"
+  GIT_INDEX_FILE="$tmp/index" git read-tree "$b"
+  GIT_INDEX_FILE="$tmp/index" git update-index --add \
+    --cacheinfo "100644,$meta,.orbis/branches/$name" --cacheinfo "100644,$blob,.orbis/branches/$name.bundle"
+  tree="$(GIT_INDEX_FILE="$tmp/index" git write-tree)"
+  commit="$(git commit-tree "$tree" -p "$b" -m "orbis private branch $name")"
+  # last push wins, the stub is always rebuilt on the base
+  # the real url, an orbis:: pushurl would send us back through the helper
+  url="$(git remote get-url --push "$remote")"
+  git push -q -f "${url#orbis::}" "$commit:refs/heads/$name" || die "push failed"
+  echo "pushed private branch $name to $remote"
+}
+
+cmd_fetch_private() { # branch [remote]
+  local name="${1:-}" remote="${2:-origin}" tmp stub meta oid out plain key sum
+  [ -n "$name" ] || die "usage: git orbis fetch-private <branch> [remote]"
+  load_config; need_identity
+  git fetch -q "$remote" "refs/heads/$name" || die "no branch $name on $remote"
+  stub="$(git rev-parse FETCH_HEAD)"
+  meta="$(git cat-file blob "$stub:.orbis/branches/$name" 2>/dev/null)" || die "$name isn't a private branch"
+  [ "$(head -1 <<<"$meta")" = "orbis-branch v1" ] || die "$name isn't a private branch"
+  oid="$(sed -n 's/^object: //p' <<<"$meta")"
+
+  if ! out="$(cli pre --ring-pk "$ORBIS_RING_PK" --object-id "$oid" 2>&1)" \
+    || ! plain="$(grep 'Decrypted Secret:' <<<"$out" | sed 's/.*Decrypted Secret: //')" \
+    || [ -z "$plain" ]; then
+    die "no access to private branch $name (object $oid)"
+  fi
+  # no trailing newline, so read returns 1 even when it worked
+  read -r key sum < <(base64 -d <<<"$plain") || true
+  [ -n "$key" ] && [ -n "$sum" ] || die "bad secret for private branch $name"
+
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  git cat-file blob "$stub:.orbis/branches/$name.bundle" >"$tmp/enc"
+  openssl enc -d -aes-256-cbc -pbkdf2 -pass fd:3 -in "$tmp/enc" -out "$tmp/bundle" 3<<<"$key" \
+    || die "decrypt failed"
+  [ "$(shasum -a 256 <"$tmp/bundle" | cut -d' ' -f1)" = "$sum" ] || die "bundle for $name doesn't match its checksum"
+  # fast forward only, never clobber local work
+  git fetch -q "$tmp/bundle" "refs/heads/$name:refs/heads/$name" \
+    || die "can't update local $name, it's diverged or checked out"
+  echo "fetched private branch $name"
+}
+
+# push a private branch's real commits under a public name and drop the
+# encrypted copy. one way, anyone who fetches it keeps the plaintext.
+cmd_private_publish() { # [--yes] branch new-name [remote]
+  local yes= name new remote ans
+  if [ "${1:-}" = --yes ]; then yes=1; shift; fi
+  name="${1:-}" new="${2:-}" remote="${3:-origin}"
+  [ -n "$name" ] && [ -n "$new" ] || die "usage: git orbis private-publish [--yes] <branch> <new-name> [remote]"
+  [ -n "$(branch_owners "$name")" ] || die "$name isn't a private branch"
+  [ -z "$(branch_owners "$new")" ] || die "$new matches a branch: rule, pick a public name"
+  git rev-parse -q --verify "refs/heads/$new" >/dev/null && die "branch $new already exists"
+  git rev-parse -q --verify "refs/heads/$name" >/dev/null || cmd_fetch_private "$name" "$remote"
+
+  if [ -z "$yes" ]; then
+    { : </dev/tty; } 2>/dev/null || die "no terminal to confirm, pass --yes"
+    printf 'git-orbis: %s goes public as %s on %s. code, commit messages, authors.\n  this can not be undone. type yes: ' "$name" "$new" "$remote" >/dev/tty
+    read -r ans </dev/tty || true
+    [ "$ans" = yes ] || die "aborted"
+  fi
+
+  git branch -m "$name" "$new"
+  git push -q -u "$remote" "refs/heads/$new:refs/heads/$new" || die "push $new failed, local branch is now $new"
+  # a delete is a normal push, the helper passes it through
+  git push -q "$remote" ":refs/heads/$name" || echo "git-orbis: couldn't delete $name on $remote, do it by hand" >&2
+  echo "published $name as $new on $remote"
+}
+
+# git-remote-orbis lands here when origin's pushurl is orbis::<url>.
+# private branches go to push-private, the rest is a normal push to <url>.
+# stdout is git's, so everything else goes to stderr or the tty.
+cmd_remote_helper() { # remote url
+  local remote="$1" url="$2" line
+  local -a specs=()
+  while IFS= read -r line; do
+    case "$line" in
+      capabilities) printf 'push\n\n' ;;
+      list*) helper_list "$url" ;;
+      push\ *) specs+=("${line#push }") ;;
+      '')
+        [ ${#specs[@]} -gt 0 ] || exit 0
+        helper_push "$remote" "$url" "${specs[@]}"
+        specs=()
+        ;;
+    esac
+  done
+}
+
+# real refs, minus private branches. the remote holds a stub for those, which
+# git would call non-fast-forward and never hand to us.
+helper_list() { # url
+  local sha ref
+  while read -r sha ref; do
+    case "$ref" in HEAD | *'^{}') continue ;; esac
+    [ -n "$(branch_owners "${ref#refs/heads/}")" ] && [[ "$ref" == refs/heads/* ]] && continue
+    echo "$sha $ref"
+  done < <(git ls-remote "$1")
+  echo
+}
+
+helper_push() { # remote url spec...
+  local remote="$1" url="$2" spec src dst name me out flag ref summary
+  local -a normal=() results=()
+  shift 2
+  me="$(whoami_did 2>/dev/null || true)"
+  for spec in "$@"; do
+    src="${spec#+}"; dst="${src#*:}"; src="${src%%:*}"
+    name="${dst#refs/heads/}"
+    if [ -z "$src" ] || [[ "$dst" != refs/heads/* ]] || [ -z "$(branch_owners "$name")" ]; then
+      normal+=("$spec"); continue
+    fi
+    [ "$src" = "$dst" ] || { results+=("error $dst push private branches under their own name"); continue; }
+    if ! readers_for_branch "$name" 2>/dev/null | grep -qxF -- "$me"; then
+      case "$(ask_private "$name")" in
+        n) normal+=("$spec"); continue ;;
+        e) ;;
+        *) results+=("error $dst not on the branch: rule for $name"); continue ;;
+      esac
+    fi
+    echo "git-orbis: $name is private ($(branch_owners "$name")), pushing encrypted" >&2
+    if (cmd_push_private "$name" "$remote") >&2; then
+      results+=("ok $dst")
+    else
+      results+=("error $dst push-private failed")
+    fi
+  done
+
+  if [ ${#normal[@]} -gt 0 ]; then
+    out="$(git push --porcelain "$url" "${normal[@]}")" || true
+    for spec in "${normal[@]}"; do
+      dst="${spec#*:}"
+      line="$(awk -F'\t' -v d=":$dst" 'substr($2, length($2) - length(d) + 1) == d {print; exit}' <<<"$out")"
+      flag="${line%%$'\t'*}"; summary="${line##*$'\t'}"
+      case "$flag" in
+        '') results+=("error $dst push failed") ;;
+        '!') results+=("error $dst $summary") ;;
+        *) results+=("ok $dst") ;;
+      esac
+    done
+  fi
+  for ref in "${results[@]}"; do echo "$ref"; done
+  echo
+}
+
+# you're pushing a private branch you aren't a reader of. no tty means no.
+ask_private() { # name
+  local ans
+  { : </dev/tty; } 2>/dev/null || return 0
+  printf 'git-orbis: you are not on the branch: rule for %s.\n  [e] encrypted push (adds you as a reader)\n  [n] normal push, plaintext, anyone can read it\n  [a] abort\nchoice [a]: ' "$1" >/dev/tty
+  read -r ans </dev/tty || true
+  echo "${ans:-a}"
 }
 
 case "${1:-}" in
@@ -281,5 +604,10 @@ case "${1:-}" in
   whoami) cmd_whoami ;;
   grant) shift; cmd_grant "$@" ;;
   sync) cmd_sync ;;
-  *) sed -n '2,13p' "$0"; exit 1 ;;
+  push-private) shift; cmd_push_private "$@" ;;
+  fetch-private) shift; cmd_fetch_private "$@" ;;
+  access) shift; cmd_access "$@" ;;
+  remote-helper) shift; cmd_remote_helper "$@" ;;
+  private-publish) shift; cmd_private_publish "$@" ;;
+  *) sed -n '2,17p' "$0"; exit 1 ;;
 esac

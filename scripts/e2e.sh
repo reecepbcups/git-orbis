@@ -98,4 +98,61 @@ clone carol 2>/dev/null
 grep -q topsecret "$W/carol/.env.production" && ok "carol decrypts .env.production" || fail "carol got: $(cat "$W/carol/.env.production")"
 head -1 "$W/carol/.env" | grep -qx "orbis-git v1" && ok "carol (not @all) can't read .env" || fail "carol read .env"
 
+echo "==> alice pushes a private branch for @ops"
+cd "$W/alice"
+echo 'branch:feat-*  @ops' >> .orbis/access
+gitq alice commit -qam "ops only feature branches"
+git push -q origin main
+git checkout -q -b feat-x
+echo "func launch() {} // PRIVATE_FEATURE_CODE" > launch.go
+git add launch.go
+gitq alice commit -qm "PRIVATE_COMMIT_MSG"
+git orbis push-private feat-x >/dev/null
+git checkout -q main
+git -C "$W/origin.git" rev-parse -q --verify refs/heads/feat-x >/dev/null \
+  && ok "feat-x visible on remote" || fail "feat-x not on remote"
+git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -qaE 'PRIVATE_FEATURE_CODE|PRIVATE_COMMIT_MSG' \
+  && fail "private branch leaked" || ok "no private code or commit msg in remote objects"
+as carol git orbis fetch-private feat-x >/dev/null
+as carol git show feat-x:launch.go | grep -q PRIVATE_FEATURE_CODE \
+  && ok "carol (ops) gets the private branch" || fail "carol missing feat-x"
+as bob git orbis fetch-private feat-x 2>/dev/null && fail "bob fetched feat-x" || ok "bob (not ops) can't fetch feat-x"
+
+echo "==> plain git push of a private branch encrypts it"
+cd "$W/alice"
+git checkout -q feat-x
+echo "func land() {} // PRIVATE_PLAIN_PUSH" > land.go
+git add land.go
+gitq alice commit -qm "PRIVATE_MSG_2"
+git push -q origin feat-x 2>/dev/null
+git checkout -q main
+git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -qaE 'PRIVATE_PLAIN_PUSH|PRIVATE_MSG_2' \
+  && fail "plain push leaked feat-x" || ok "plain git push of feat-x stays encrypted"
+as carol git orbis fetch-private feat-x >/dev/null
+as carol git show feat-x:land.go | grep -q PRIVATE_PLAIN_PUSH \
+  && ok "carol gets the plain pushed update" || fail "carol missing land.go"
+as bob git pull -q --ff-only
+as bob git checkout -q -b feat-bob
+echo "BOB_SECRET" > "$W/bob/bob.txt"
+as bob git add bob.txt
+as bob gitq bob commit -qm "bob"
+as bob git push -q origin feat-bob </dev/null 2>/dev/null && fail "bob pushed feat-bob" || ok "bob (not ops, no tty) can't push feat-bob"
+git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -qa BOB_SECRET \
+  && fail "feat-bob leaked" || ok "nothing from feat-bob on remote"
+
+echo "==> sync grants existing private branches to new readers"
+git orbis grant "$(did bob)" ops >/dev/null
+git orbis sync >/dev/null
+as bob git orbis fetch-private feat-x >/dev/null 2>&1 \
+  && ok "bob fetches feat-x after joining ops + sync" || fail "bob still locked out of feat-x"
+
+echo "==> alice publishes feat-x"
+cd "$W/alice"
+git orbis private-publish feat-x </dev/null 2>/dev/null && fail "published without confirm" || ok "private-publish needs a confirm"
+git orbis private-publish --yes feat-x launch >/dev/null 2>&1
+git -C "$W/origin.git" show launch:land.go | grep -q PRIVATE_PLAIN_PUSH \
+  && ok "launch is public plaintext" || fail "launch not public"
+git -C "$W/origin.git" rev-parse -q --verify refs/heads/feat-x >/dev/null \
+  && fail "feat-x stub still on remote" || ok "encrypted feat-x removed"
+
 echo "PASS ($pass checks)"

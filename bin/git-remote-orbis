@@ -1,0 +1,3 @@
+#!/bin/bash
+# git runs this for orbis::<url> remotes. the logic lives in git-orbis.
+exec "$(dirname "${BASH_SOURCE[0]}")/git-orbis" remote-helper "$@"
