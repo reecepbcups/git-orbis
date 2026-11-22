@@ -150,6 +150,8 @@ You don't have to remember push-private either. Run `git orbis init` once in the
 - matches but you're not on it - it asks: encrypted, plaintext or abort. no terminal means abort
 - anything else - normal push
 
+Done hiding it? `git orbis private-publish feat-x launch` renames it to a public name, pushes the real commits and deletes the encrypted copy. It asks you to type `yes` first (`--yes` skips that), since there's no taking it back.
+
 Tab completion (zsh) comes with `git orbis install`. It links into `~/.oh-my-zsh/custom/completions`, no `.zshrc` edit. Without oh-my-zsh, add `~/git-orbis/completions` to your `fpath`.
 
 Your identity seed lives in `~/.ssh/git-orbis` (0600). `ORBIS_READER_DID_PK` overrides it, `ORBIS_IDENTITY_FILE` moves it. `git orbis init` sets the filter for one clone only if you'd rather not touch your global config.

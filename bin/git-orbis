@@ -12,6 +12,7 @@
 #   git orbis init            filter for this clone only (instead of install)
 #   git orbis push-private <branch> [remote] [base]  push branch encrypted, see branch: rules
 #   git orbis fetch-private <branch> [remote]        decrypt it into a local branch
+#   git orbis private-publish [--yes] <branch> <new-name> [remote]  make it public for good
 #   git orbis clean|smudge    called by git, not you
 set -euo pipefail
 
@@ -427,6 +428,32 @@ cmd_fetch_private() { # branch [remote]
   echo "fetched private branch $name"
 }
 
+# push a private branch's real commits under a public name and drop the
+# encrypted copy. one way, anyone who fetches it keeps the plaintext.
+cmd_private_publish() { # [--yes] branch new-name [remote]
+  local yes= name new remote ans
+  if [ "${1:-}" = --yes ]; then yes=1; shift; fi
+  name="${1:-}" new="${2:-}" remote="${3:-origin}"
+  [ -n "$name" ] && [ -n "$new" ] || die "usage: git orbis private-publish [--yes] <branch> <new-name> [remote]"
+  [ -n "$(branch_owners "$name")" ] || die "$name isn't a private branch"
+  [ -z "$(branch_owners "$new")" ] || die "$new matches a branch: rule, pick a public name"
+  git rev-parse -q --verify "refs/heads/$new" >/dev/null && die "branch $new already exists"
+  git rev-parse -q --verify "refs/heads/$name" >/dev/null || cmd_fetch_private "$name" "$remote"
+
+  if [ -z "$yes" ]; then
+    { : </dev/tty; } 2>/dev/null || die "no terminal to confirm, pass --yes"
+    printf 'git-orbis: %s goes public as %s on %s. code, commit messages, authors.\n  this can not be undone. type yes: ' "$name" "$new" "$remote" >/dev/tty
+    read -r ans </dev/tty || true
+    [ "$ans" = yes ] || die "aborted"
+  fi
+
+  git branch -m "$name" "$new"
+  git push -q -u "$remote" "refs/heads/$new:refs/heads/$new" || die "push $new failed, local branch is now $new"
+  # a delete is a normal push, the helper passes it through
+  git push -q "$remote" ":refs/heads/$name" || echo "git-orbis: couldn't delete $name on $remote, do it by hand" >&2
+  echo "published $name as $new on $remote"
+}
+
 # git-remote-orbis lands here when origin's pushurl is orbis::<url>.
 # private branches go to push-private, the rest is a normal push to <url>.
 # stdout is git's, so everything else goes to stderr or the tty.
@@ -524,5 +551,6 @@ case "${1:-}" in
   fetch-private) shift; cmd_fetch_private "$@" ;;
   access) shift; cmd_access "$@" ;;
   remote-helper) shift; cmd_remote_helper "$@" ;;
-  *) sed -n '2,16p' "$0"; exit 1 ;;
+  private-publish) shift; cmd_private_publish "$@" ;;
+  *) sed -n '2,17p' "$0"; exit 1 ;;
 esac

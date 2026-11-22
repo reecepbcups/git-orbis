@@ -140,4 +140,13 @@ as bob git push -q origin feat-bob </dev/null 2>/dev/null && fail "bob pushed fe
 git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -qa BOB_SECRET \
   && fail "feat-bob leaked" || ok "nothing from feat-bob on remote"
 
+echo "==> alice publishes feat-x"
+cd "$W/alice"
+git orbis private-publish feat-x </dev/null 2>/dev/null && fail "published without confirm" || ok "private-publish needs a confirm"
+git orbis private-publish --yes feat-x launch >/dev/null 2>&1
+git -C "$W/origin.git" show launch:land.go | grep -q PRIVATE_PLAIN_PUSH \
+  && ok "launch is public plaintext" || fail "launch not public"
+git -C "$W/origin.git" rev-parse -q --verify refs/heads/feat-x >/dev/null \
+  && fail "feat-x stub still on remote" || ok "encrypted feat-x removed"
+
 echo "PASS ($pass checks)"

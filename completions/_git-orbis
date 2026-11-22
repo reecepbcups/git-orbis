@@ -12,6 +12,7 @@ cmds=(
   'init:filter + encrypted push for this clone'
   'push-private:push a branch encrypted'
   'fetch-private:decrypt a private branch'
+  'private-publish:make a private branch public'
 )
 
 if (( CURRENT == 2 )); then
@@ -44,6 +45,7 @@ _git_orbis_teams() { # prefix
 case "$words[2]:$((CURRENT - 2))" in
   push-private:1) _git_orbis_private refs/heads 2 ;;
   fetch-private:1) _git_orbis_private refs/remotes/${words[4]:-origin} 3 ;;
+  private-publish:1) _git_orbis_private refs/heads 2 ;;
   push-private:2 | fetch-private:2) compadd -- ${(f)"$(git remote 2>/dev/null)"} ;;
   push-private:3) compadd -- ${(f)"$(git for-each-ref --format='%(refname:short)' refs/remotes 2>/dev/null)"} ;;
   grant:2) _git_orbis_teams ;;
