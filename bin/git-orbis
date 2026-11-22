@@ -58,8 +58,19 @@ create_identity() {
 }
 
 cmd_whoami() {
+  local did teams
   [ -n "${ORBIS_READER_DID_PK:-}" ] || create_identity
-  whoami_did
+  did="$(whoami_did)"
+  echo "$did"
+  git rev-parse --show-toplevel >/dev/null 2>&1 || return 0
+  teams="$({
+    readers | grep -qxF -- "$did" && echo @all
+    repo_file .orbis/teams | grep -v '^[[:space:]]*#' \
+      | awk -v d="$did" '{for (i = 2; i <= NF; i++) if ($i == d) { sub(":$", "", $1); print "@" $1 }}'
+  } | tr '\n' ' ')"
+  # stderr so `git orbis whoami > .orbis/readers` still works
+  teams="${teams% }"
+  echo "teams: ${teams:-none}" >&2
 }
 
 readers() { grep -v '^#' "$(top)/.orbis/readers" 2>/dev/null | awk 'NF{print $1}'; }
