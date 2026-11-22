@@ -48,12 +48,13 @@ git checkout / clone / pull
 Few details that matter:
 
 - **Same content, same pointer.** Clean caches `sha256(plaintext) -> pointer` in `.git/orbis/`, and smudge fills that cache too. Without it every `git status` would think `.env` changed.
+- **One process, like git-lfs.** `.gitattributes` has `* filter=orbis`, so every file goes through the filter. `orbis-filter` (Go, in `cmd/orbis-filter`) is started once per git command and passes plain files straight back, so 5k files cost about 0.2s on top of plain git. Only files `.orbis/access` covers get handed to the `git-orbis` script.
 - **Fails closed.** `filter.orbis.required=true` means if clean can't reach orbis, git refuses to commit. It never falls back to committing plaintext.
 - **The repo files.** `.orbis/config` (ring id, ring public key, policy id), `.orbis/readers`, `.orbis/teams` and `.orbis/access` get committed. None of them are secret, it's fine for them to be public.
 
 ## Try it locally
 
-Needs docker and a rust toolchain (for `make tools`).
+Needs docker, a rust toolchain and go (for `make tools`). `make test` runs the go tests.
 
 ```bash
 make up      # vera + 3 orbis nodes in docker, project "git-orbis", ports 390xx
