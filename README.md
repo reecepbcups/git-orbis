@@ -123,7 +123,7 @@ It's a POC, so:
 - **Teams are read only.** They control who can decrypt, not who can change a file. Anyone who can push can commit a new `.env` or edit `.orbis/access`. Use GitHub CODEOWNERS + branch protection on `.orbis/` and the secret files for that.
 - **Forget `sync`, leak plaintext.** A new pattern in `.orbis/access` isn't encrypted until `git orbis sync` puts it in `.gitattributes`.
 - **No revoke.** Removing a reader doesn't take anything back. Rotate the actual secret (true for every git secret tool, old versions live in history).
-- **Slow-ish commits.** A changed `.env` costs ~20s (1 store + 1 register + 1 grant per reader, each waits for a block). Unchanged files are instant. Batching the grants into one tx would get it to ~8s.
+- **Slow-ish commits.** A changed secret costs ~7s: 1 block to store it, 1 block to register it and grant every reader in one tx. Unchanged files are instant. Blocks are 5s on the localnet, so that's most of it.
 - **`ps` can see it.** The secret goes to `cli-tool` as `--secret` while committing.
 - **Shared writer key.** Everyone writes with the public devnet key, which owns the ACP objects.
 - **Seeds are toy strings** in the demo. Use random ones.
@@ -134,4 +134,5 @@ It's a POC, so:
 
 - `reader-did` prints the DID for a seed
 - `set-relationship-on-chain --actor-did` grants by DID (before you needed the reader's private seed)
+- `grant-batch --actor-dids a,b,c [--register]` grants many DIDs (and registers the object) in one tx
 - `ring_policy` and `ring` resources in the default policy, since this vera build requires them to create a ring
