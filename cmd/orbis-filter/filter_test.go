@@ -45,6 +45,7 @@ func TestAccessPatterns(t *testing.T) {
 		{"empty", "", nil},
 		{"comments and blanks", "# hi\n\n  # indented\n", nil},
 		{"rules", ".env*  @all\n.env.production @ops did:key:z\n", []string{".env*", ".env.production"}},
+		{"branch rules skipped", ".env* @all\nbranch:feat-* @ops\n", []string{".env*"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

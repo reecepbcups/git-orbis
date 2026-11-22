@@ -63,7 +63,7 @@ make e2e     # alice / bob / mallory / carol against a local bare "github" remot
 make down    # wipes the chain. pointers made against it are dead after this
 ```
 
-`make e2e` checks 16 things: nothing secret ever reaches the remote, readers decrypt, non-readers get the pointer, per-file teams, rotation, history and adding someone to a team. Takes about a minute.
+`make e2e` checks 22 things: nothing secret ever reaches the remote, readers decrypt, non-readers get the pointer, per-file teams, rotation, history, adding someone to a team and private branches. Takes about a minute.
 
 Images are public and pinned by digest: `ghcr.io/sourcenetwork/orbis-rs` (jubjub build) and `ghcr.io/sourcenetwork/vera` (the `:dev` build from 2026-11-12).
 
@@ -113,6 +113,28 @@ git orbis grant did:key:z6Mk... ops    # adds to the ops team
 git commit -am "give <name> access" && git push
 ```
 
+### Private branches
+
+A whole branch can be private too. Add a `branch:` rule to `.orbis/access` (glob, last match wins, same owners as files):
+
+```text
+branch:feat-*   @ops
+```
+
+```bash
+git orbis push-private feat-x            # [remote] [base], defaults origin origin/main
+git orbis fetch-private feat-x           # readers get a real local feat-x
+```
+
+GitHub gets a branch called `feat-x`, so everyone can see it's there. It's just `origin/main` plus two files:
+
+- `.orbis/branches/feat-x` - the orbis object id and the base commit
+- `.orbis/branches/feat-x.bundle` - the branch as a `git bundle`, AES-256 encrypted
+
+The AES key (and the bundle's sha256) is the orbis secret, so only DIDs on the rule can decrypt it. Code, file names, commit messages and authors stay hidden. The branch name, its size and when you pushed don't.
+
+No matching `branch:` rule means push-private refuses, it won't fall back to `@all`.
+
 Your identity seed lives in `~/.ssh/git-orbis` (0600). `ORBIS_READER_DID_PK` overrides it, `ORBIS_IDENTITY_FILE` moves it. `git orbis init` sets the filter for one clone only if you'd rather not touch your global config.
 
 ## Known gaps
@@ -124,6 +146,8 @@ It's a POC, so:
 - **Forget `sync`, leak plaintext.** A new pattern in `.orbis/access` isn't encrypted until `git orbis sync` puts it in `.gitattributes`.
 - **No revoke.** Removing a reader doesn't take anything back. Rotate the actual secret (true for every git secret tool, old versions live in history).
 - **Slow-ish commits.** A changed secret costs ~7s: 1 block to store it, 1 block to register it and grant every reader in one tx. Unchanged files are instant. Blocks are 5s on the localnet, so that's most of it.
+- **Plain `git push` on a private branch leaks it.** Use `push-private`. Once the stub is on the remote a plain push gets rejected as non-fast-forward, but `-f` or the very first push goes through in plaintext.
+- **Private branches are last push wins.** Every `push-private` force pushes a full new bundle. Two people pushing the same one clobber each other. No PR diff view on GitHub either, merging means pushing the code to main for real.
 - **`ps` can see it.** The secret goes to `cli-tool` as `--secret` while committing.
 - **Shared writer key.** Everyone writes with the public devnet key, which owns the ACP objects.
 - **Seeds are toy strings** in the demo. Use random ones.

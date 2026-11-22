@@ -98,4 +98,24 @@ clone carol 2>/dev/null
 grep -q topsecret "$W/carol/.env.production" && ok "carol decrypts .env.production" || fail "carol got: $(cat "$W/carol/.env.production")"
 head -1 "$W/carol/.env" | grep -qx "orbis-git v1" && ok "carol (not @all) can't read .env" || fail "carol read .env"
 
+echo "==> alice pushes a private branch for @ops"
+cd "$W/alice"
+echo 'branch:feat-*  @ops' >> .orbis/access
+gitq alice commit -qam "ops only feature branches"
+git push -q origin main
+git checkout -q -b feat-x
+echo "func launch() {} // PRIVATE_FEATURE_CODE" > launch.go
+git add launch.go
+gitq alice commit -qm "PRIVATE_COMMIT_MSG"
+git orbis push-private feat-x >/dev/null
+git checkout -q main
+git -C "$W/origin.git" rev-parse -q --verify refs/heads/feat-x >/dev/null \
+  && ok "feat-x visible on remote" || fail "feat-x not on remote"
+git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -qaE 'PRIVATE_FEATURE_CODE|PRIVATE_COMMIT_MSG' \
+  && fail "private branch leaked" || ok "no private code or commit msg in remote objects"
+as carol git orbis fetch-private feat-x >/dev/null
+as carol git show feat-x:launch.go | grep -q PRIVATE_FEATURE_CODE \
+  && ok "carol (ops) gets the private branch" || fail "carol missing feat-x"
+as bob git orbis fetch-private feat-x 2>/dev/null && fail "bob fetched feat-x" || ok "bob (not ops) can't fetch feat-x"
+
 echo "PASS ($pass checks)"

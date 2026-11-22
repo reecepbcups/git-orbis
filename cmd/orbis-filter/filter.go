@@ -127,11 +127,12 @@ func (f *filter) load(ctx context.Context) error {
 }
 
 // accessPatterns pulls the pattern column out of .orbis/access.
+// branch: rules are for push-private, not files.
 func accessPatterns(src []byte) []string {
 	var pats []string
 	for l := range strings.SplitSeq(string(src), "\n") {
 		fields := strings.Fields(l)
-		if len(fields) == 0 || strings.HasPrefix(fields[0], "#") {
+		if len(fields) == 0 || strings.HasPrefix(fields[0], "#") || strings.HasPrefix(fields[0], "branch:") {
 			continue
 		}
 		pats = append(pats, fields[0])
