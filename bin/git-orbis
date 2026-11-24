@@ -287,7 +287,7 @@ cmd_clean() { # path
   split -a 4 -b "${ORBIS_CHUNK_BYTES:-49152}" "$tmp" "$tmp.part."
   [ -s "$tmp" ] || : >"$tmp.part.aaaa"
   # each chunk is its own tx, so upload ORBIS_PARALLEL at a time
-  local n=0 par="${ORBIS_PARALLEL:-8}"
+  local n=0 par="${ORBIS_PARALLEL:-16}"
   for part in "$tmp".part.????; do
     store_chunk "$part" &
     n=$((n + 1)); [ $((n % par)) -ne 0 ] || wait
@@ -306,20 +306,33 @@ cmd_clean() { # path
 
 cache_key() { { printf '%s\0' "$1"; cat "$2"; } | shasum -a 256 | cut -d' ' -f1; }
 
+# base64 plaintext of one object in <out>, nothing there without access
+fetch_chunk() { # oid out
+  local out
+  out="$(cli pre --ring-pk "$ORBIS_RING_PK" --object-id "$1" 2>&1)" || return 0
+  grep 'Decrypted Secret:' <<<"$out" | sed 's/.*Decrypted Secret: //' >"$2.tmp" || return 0
+  [ -s "$2.tmp" ] && mv "$2.tmp" "$2"
+}
+
 # plaintext of a pointer on stdout. fails without access, printing nothing.
 decrypt() { # pointer_file
-  local oid out plain buf rc=0
+  local oid dir i=0 j rc=0 par="${ORBIS_PARALLEL:-16}"
   load_config
   [ -n "${ORBIS_READER_DID_PK:-}" ] || return 1
-  # every chunk or nothing, half a file is worse than the pointer
-  buf="$(mktemp)"
+  dir="$(mktemp -d)"; : >"$dir/plain"
+  # chunks come back ORBIS_PARALLEL at a time, numbered so they join in order
   for oid in $(sed -n 's/^object: //p' "$1"); do
-    out="$(cli pre --ring-pk "$ORBIS_RING_PK" --object-id "$oid" 2>&1)" \
-      && plain="$(grep 'Decrypted Secret:' <<<"$out" | sed 's/.*Decrypted Secret: //')" \
-      && [ -n "$plain" ] && base64 -d <<<"$plain" >>"$buf" || { rc=1; break; }
+    i=$((i + 1))
+    fetch_chunk "$oid" "$dir/$i" &
+    [ $((i % par)) -ne 0 ] || wait
   done
-  [ $rc -ne 0 ] || cat "$buf"
-  rm -f "$buf"; return $rc
+  wait
+  # every chunk or nothing, half a file is worse than the pointer
+  for ((j = 1; j <= i; j++)); do
+    [ -s "$dir/$j" ] && base64 -d <"$dir/$j" >>"$dir/plain" || { rc=1; break; }
+  done
+  [ $rc -ne 0 ] || cat "$dir/plain"
+  rm -rf "$dir"; return $rc
 }
 
 cmd_smudge() {
