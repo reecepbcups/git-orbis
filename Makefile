@@ -4,7 +4,7 @@ COMPOSE := docker compose -p git-orbis -f orbis/docker-compose.yml
 VERA_IMAGE ?= ghcr.io/reecepbcups/git-orbis-vera:$(shell git hash-object orbis/vera.Dockerfile | cut -c1-12)
 export VERA_IMAGE
 
-.PHONY: tools filter test up setup e2e down vera-image
+.PHONY: tools filter test test-update up setup e2e down vera-image
 
 # patched orbis cli-tool (jubjub, matches the node image) + the git filter process
 tools: .tools/bin/cli-tool filter
@@ -31,6 +31,10 @@ setup: tools
 
 e2e: tools
 	scripts/e2e.sh
+
+# git orbis update against fake signed releases, no chain needed
+test-update: tools
+	scripts/update-test.sh
 
 down:
 	$(COMPOSE) down -v

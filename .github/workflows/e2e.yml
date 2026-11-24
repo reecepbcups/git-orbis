@@ -117,6 +117,9 @@ jobs:
       - name: Build tools
         run: make tools
 
+      - name: Update test
+        run: make test-update
+
       - name: Pull vera
         run: docker pull "$(make -s vera-image)"
 

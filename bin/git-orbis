@@ -14,6 +14,7 @@
 #   git orbis push-private <branch> [remote] [base]  push branch encrypted, see branch: rules
 #   git orbis fetch-private <branch> [remote]        decrypt it into a local branch
 #   git orbis private-publish [--yes] <branch> <new-name> [remote]  make it public for good
+#   git orbis update [--yes]  install the latest signed release, asks y/n first
 #   git orbis clean|smudge|textconv  called by git, not you
 set -euo pipefail
 
@@ -741,6 +742,60 @@ helper_push() { # remote url spec...
   echo
 }
 
+# release installs unpack to these, everything else in $ROOT (like .orbis-ring.env) stays
+RELEASE_URL="${ORBIS_RELEASE_URL:-https://github.com/reecepbcups/git-orbis/releases}"
+RELEASE_FILES=(bin scripts completions .tools VERSION release.pub README.md)
+
+cmd_update() { # [--yes]
+  local yes= cur os arch tmp name latest ans f
+  [ "${1:-}" != --yes ] || yes=1
+  [ ! -e "$ROOT/.git" ] || die "$ROOT is a git checkout, update it with git pull && make tools"
+  cur="$(cat "$ROOT/VERSION" 2>/dev/null)" || die "no $ROOT/VERSION, not a release install"
+  case "$(uname -s)" in Darwin) os=darwin ;; Linux) os=linux ;; *) die "no release for $(uname -s)" ;; esac
+  case "$(uname -m)" in x86_64 | amd64) arch=amd64 ;; arm64 | aarch64) arch=arm64 ;; *) die "no release for $(uname -m)" ;; esac
+
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp" "$ROOT/.update-new"' RETURN
+  curl -fsSL "$RELEASE_URL/latest/download/SHA256SUMS" -o "$tmp/SHA256SUMS" \
+    && curl -fsSL "$RELEASE_URL/latest/download/SHA256SUMS.sig" -o "$tmp/SHA256SUMS.sig" \
+    || die "couldn't fetch the latest release from $RELEASE_URL"
+  # only the key this install already trusts, never one from the download
+  openssl dgst -sha256 -verify "$ROOT/release.pub" -signature "$tmp/SHA256SUMS.sig" "$tmp/SHA256SUMS" >/dev/null 2>&1 \
+    || die "SHA256SUMS isn't signed by $ROOT/release.pub, not updating"
+  # the version comes from the signed file names, so it can't be spoofed
+  name="$(awk -v s="-$os-$arch.tar.gz" 'substr($2, length($2) - length(s) + 1) == s {print $2; exit}' "$tmp/SHA256SUMS")"
+  [ -n "$name" ] || die "the latest release has no $os-$arch build"
+  latest="${name#git-orbis-}"; latest="${latest%-$os-$arch.tar.gz}"
+  if [ "$latest" = "$cur" ]; then echo "git-orbis $cur is the latest"; return; fi
+  # a stale or replayed release must not downgrade you
+  [ "$(printf '%s\n%s\n' "${cur#v}" "${latest#v}" | sort -V | tail -1)" = "${latest#v}" ] \
+    || die "latest release $latest is older than $cur, not downgrading"
+
+  if [ -z "$yes" ]; then
+    { : </dev/tty; } 2>/dev/null || die "no terminal to confirm, pass --yes"
+    printf 'git-orbis: update %s -> %s? [y/N] ' "$cur" "$latest" >/dev/tty
+    read -r ans </dev/tty || true
+    case "$ans" in y | Y | yes) ;; *) die "aborted" ;; esac
+  fi
+
+  curl -fsSL "$RELEASE_URL/download/$latest/$name" -o "$tmp/$name" || die "download $name failed"
+  [ "$(shasum -a 256 <"$tmp/$name" | cut -d' ' -f1)" = "$(awk -v n="$name" '$2 == n {print $1}' "$tmp/SHA256SUMS")" ] \
+    || die "$name doesn't match its signed sha256, not updating"
+  # unpack next to the install so the swap below is a rename, not a copy
+  rm -rf "$ROOT/.update-new" "$ROOT/.update-old"
+  mkdir "$ROOT/.update-new" "$ROOT/.update-old"
+  tar -xzf "$tmp/$name" -C "$ROOT/.update-new" || die "unpacking $name failed"
+  [ "$(cat "$ROOT/.update-new/git-orbis/VERSION" 2>/dev/null)" = "$latest" ] || die "$name says it isn't $latest"
+  # rename, so bash keeps reading this running script from its old inode
+  for f in "${RELEASE_FILES[@]}"; do
+    [ -e "$ROOT/.update-new/git-orbis/$f" ] || continue
+    [ ! -e "$ROOT/$f" ] || mv "$ROOT/$f" "$ROOT/.update-old/$f"
+    mv "$ROOT/.update-new/git-orbis/$f" "$ROOT/$f"
+  done
+  # kept until here so a failed swap leaves the old files to put back
+  rm -rf "$ROOT/.update-old"
+  echo "git-orbis updated $cur -> $latest"
+}
+
 # you're pushing a private branch you aren't a reader of. no tty means no.
 ask_private() { # name
   local ans
@@ -766,5 +821,6 @@ case "${1:-}" in
   access) shift; cmd_access "$@" ;;
   remote-helper) shift; cmd_remote_helper "$@" ;;
   private-publish) shift; cmd_private_publish "$@" ;;
-  *) sed -n '2,18p' "$0"; exit 1 ;;
+  update) shift; cmd_update "$@" ;;
+  *) sed -n '2,19p' "$0"; exit 1 ;;
 esac
