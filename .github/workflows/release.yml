@@ -1,0 +1,84 @@
+name: Release
+
+# Push a vX.Y.Z tag. Every platform gets a tarball, SHA256SUMS is signed with
+# RELEASE_SIGNING_KEY (P-256, release.pub is the pinned public half) and it all
+# goes up in one `gh release create`. `git orbis update` checks that signature.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # 22.04 so the linux builds run on older glibc too
+          - { os: linux, arch: amd64, runner: ubuntu-22.04 }
+          - { os: linux, arch: arm64, runner: ubuntu-22.04-arm }
+          - { os: darwin, arch: amd64, runner: macos-15-intel }
+          - { os: darwin, arch: arm64, runner: macos-15 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build deps (linux)
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libssl-dev pkg-config libdbus-1-dev
+
+      - name: Build deps (mac)
+        if: matrix.os == 'darwin'
+        run: brew install protobuf
+
+      - name: Build tools
+        env:
+          CGO_ENABLED: "0"
+        run: make tools
+
+      - name: Package
+        run: scripts/package.sh "$GITHUB_REF_NAME" ${{ matrix.os }} ${{ matrix.arch }} dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tarball-*
+          merge-multiple: true
+          path: dist
+
+      - name: Sign SHA256SUMS
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          [ -n "$RELEASE_SIGNING_KEY" ] || { echo "::error::RELEASE_SIGNING_KEY isn't set"; exit 1; }
+          cd dist
+          sha256sum ./*.tar.gz | sed 's| \./| |' > SHA256SUMS
+          key="$(mktemp)"; trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
+          openssl dgst -sha256 -sign "$key" -out SHA256SUMS.sig SHA256SUMS
+          # same check git orbis update does, so a key that doesn't match release.pub never ships
+          openssl dgst -sha256 -verify ../release.pub -signature SHA256SUMS.sig SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes dist/*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sig

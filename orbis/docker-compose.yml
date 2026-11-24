@@ -1,7 +1,8 @@
 # Local Vera + 3 Orbis nodes (jubjub). Trimmed copy of shieldd's
 # deployments/orbis stack, no defra. Passwords and keys here are local fixtures.
-# Both images are public and digest pinned. vera is the published :dev build
-# from 2026-11-12 since vera doesn't publish per-commit images we can match.
+# orbis-rs is public and digest pinned. vera is built from vera.Dockerfile
+# (pinned commit + mizu cometbft) so blocks only happen when there are txs.
+# make sets VERA_IMAGE to the CI prebuilt, compose builds it if the pull fails.
 x-node: &node
   image: ${ORBIS_IMAGE:-ghcr.io/sourcenetwork/orbis-rs@sha256:2cf79b0524e73a7b4f069b6a288c7f18e91d8c87aba8f785cd874d07ee76d59e}
   restart: on-failure
@@ -14,7 +15,8 @@ x-node-cmd: &node-cmd ["--addr", "0.0.0.0:50051", "--log-level", "info", "--serv
 
 services:
   vera:
-    image: ${VERA_IMAGE:-ghcr.io/sourcenetwork/vera@sha256:321e3045c59d2213f358a328a5b299e5fd3370b714db9326e19a5fe5ac8419c5}
+    build: {context: ., dockerfile: vera.Dockerfile}
+    image: ${VERA_IMAGE:-git-orbis-vera:local}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -25,11 +27,24 @@ services:
           echo "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" | verad keys add test --recover --keyring-backend test --home /home/node/.vera
           echo "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art" | verad keys add funder --recover --keyring-backend test --home /home/node/.vera
           verad genesis add-genesis-account validator 100000000000uopen --keyring-backend test --home /home/node/.vera
-          verad genesis add-genesis-account test 100000000000uopen --keyring-backend test --home /home/node/.vera
-          verad genesis add-genesis-account funder 100000000000uopen --keyring-backend test --home /home/node/.vera
+          # huge balances so a local stack never runs out of fees, a chunk is ~0.28 OPEN
+          verad genesis add-genesis-account test 1000000000000000000000uopen --keyring-backend test --home /home/node/.vera
+          verad genesis add-genesis-account funder 1000000000000000000000uopen --keyring-backend test --home /home/node/.vera
           verad genesis gentx validator 10000000000uopen --keyring-backend test --chain-id vera-localnet --home /home/node/.vera
           verad genesis collect-gentxs --home /home/node/.vera
+          # 100MB blocks (the cometbft max) so parallel chunk uploads all fit in one
+          sed -i 's/"max_bytes": "22020096"/"max_bytes": "104857600"/' /home/node/.vera/config/genesis.json
+          grep -q '"max_bytes": "104857600"' /home/node/.vera/config/genesis.json
         fi
+        # only make blocks for txs, with an empty heartbeat block a day if idle
+        CFG=/home/node/.vera/config/config.toml
+        sed -i 's/^create_empty_blocks = .*/create_empty_blocks = false/; s/^create_empty_blocks_interval = .*/create_empty_blocks_interval = "24h"/' $$CFG
+        # blocks only come from txs, so commit right away instead of idling 5s per tx
+        sed -i 's/^timeout_commit = .*/timeout_commit = "0s"/' $$CFG
+        grep -q '^proof_block_mode' $$CFG || sed -i '/^\[consensus\]/a proof_block_mode = "always"' $$CFG
+        sed -i 's/^proof_block_mode = .*/proof_block_mode = "only_after_tx"/' $$CFG
+        # git-orbis stores 1MB chunks, base64 + ring encryption need room past the 1MB default
+        sed -i 's/^max_tx_bytes = .*/max_tx_bytes = 8388608/; s/^max_body_bytes = .*/max_body_bytes = 8388608/' $$CFG
         exec verad start --home /home/node/.vera --rpc.laddr tcp://0.0.0.0:26657 --api.enable --api.address tcp://0.0.0.0:1317
     volumes: [vera-data:/home/node/.vera]
     ports:
@@ -67,7 +82,8 @@ services:
 
   # nodes don't self-fund, so pay each one's vera account from the genesis funder
   funder:
-    image: ${VERA_IMAGE:-ghcr.io/sourcenetwork/vera@sha256:321e3045c59d2213f358a328a5b299e5fd3370b714db9326e19a5fe5ac8419c5}
+    build: {context: ., dockerfile: vera.Dockerfile}
+    image: ${VERA_IMAGE:-git-orbis-vera:local}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -81,7 +97,7 @@ services:
         until verad query block --type=height 1 --node tcp://vera:26657 >/dev/null 2>&1; do sleep 2; done
         addrs="$$(cat /n1/public_key.txt) $$(cat /n2/public_key.txt) $$(cat /n3/public_key.txt)"
         n=0
-        until out=$$(verad tx bank multi-send funder $$addrs 1000000000uopen \
+        until out=$$(verad tx bank multi-send funder $$addrs 1000000000000000000uopen \
               --keyring-backend test --home "$$H" --chain-id vera-localnet \
               --node tcp://vera:26657 --fees 2000uopen --yes -o json 2>&1) \
               && echo "$$out" | grep -q '"code":0'; do

@@ -1,3 +1,4 @@
 .tools/
 .e2e/
 .orbis-ring.env
+.update-test/

@@ -2,18 +2,20 @@
 
 Private `.env` files in a normal (even public) git repo.
 
-Git is all or nothing. If you can clone the repo you can read every file in it. git-orbis lets you commit a secret file to the same repo as your code while only the people you pick can read it. Everyone else, GitHub included, just sees a pointer:
+Git is all or nothing. If you can clone the repo you can read every file in it. git-orbis lets you commit a secret file to the same repo as your code while only the people you pick can read it. Everyone else, GitHub included, just sees a pointer with ciphertext:
 
 ```text
-orbis-git v1
+orbis-git v1.1.0
 object: 7c438b3a4ccea43321576e74421c7b9cc0bf3baaa8cd207b474508dd0e7b48ee
+
+Salted__<encrypted bytes>
 ```
 
 You don't need a special git host or a new workflow. It's a plain git filter, so `git add`, `commit`, `push`, `pull` and `clone` all work like normal.
 
 ## What it does
 
-- You `git commit` a `.env`. The real contents go into [Orbis](https://github.com/sourcenetwork/orbis-rs), and only a pointer goes into git.
+- You `git commit` a `.env`. It's encrypted with a fresh key on your machine, the key goes into [Orbis](https://github.com/sourcenetwork/orbis-rs), and the pointer plus ciphertext go into git.
 - A teammate on the readers list clones or pulls and gets the real `.env` on disk.
 - Someone not on the list (or a random person on GitHub) clones fine but keeps the pointer. Their checkout doesn't break, they just get a warning.
 - Old versions stay readable from history for readers, like any other file.
@@ -31,17 +33,18 @@ Here's the flow:
 ```text
 git add .env
   -> clean filter
-     1. store the file in orbis (encrypted to the ring's public key)
-     2. register it as an object in the ACP policy
-     3. grant "reader" to you + whoever .orbis/access says can read this path
-     4. hand git the pointer (orbis-git v1 / object: <id>)
+     1. encrypt the file with a fresh AES key, locally
+     2. store just that key in orbis (encrypted to the ring's public key)
+     3. register it as an object in the ACP policy
+     4. grant "reader" to you + whoever .orbis/access says can read this path
+     5. hand git the pointer (orbis-git v1.1.0 / object: <id> / the ciphertext)
 
 git checkout / clone / pull
   -> smudge filter
      1. read the object id from the pointer
      2. ask the ring to re-encrypt it for a fresh throwaway key (signed with your DID)
      3. nodes check the ACP policy, 2 of 3 send back shares
-     4. combine, decrypt, write the real .env
+     4. combine, decrypt the key, decrypt the ciphertext, write the real .env
      (no access? keep the pointer, print a warning, carry on)
 ```
 
@@ -49,8 +52,9 @@ Few details that matter:
 
 - **Same content, same pointer.** Clean caches `sha256(plaintext) -> pointer` in `.git/orbis/`, and smudge fills that cache too. Without it every `git status` would think `.env` changed.
 - **One process, like git-lfs.** `.gitattributes` has `* filter=orbis`, so every file goes through the filter. `orbis-filter` (Go, in `cmd/orbis-filter`) is started once per git command and passes plain files straight back, so 5k files cost about 0.2s on top of plain git. Only files `.orbis/access` covers get handed to the `git-orbis` script.
+- **Envelopes, so size doesn't matter.** Any file is one orbis tx since only the key goes on chain. A 90MB file takes ~4s each way. GitHub still caps files at 100MB though. Old `orbis-git v1` pointers (chunks stored on chain) still decrypt.
 - **Fails closed.** `filter.orbis.required=true` means if clean can't reach orbis, git refuses to commit. It never falls back to committing plaintext.
-- **The repo files.** `.orbis/config` (ring id, ring public key, policy id), `.orbis/readers`, `.orbis/teams` and `.orbis/access` get committed. None of them are secret, it's fine for them to be public.
+- **The repo files.** `.orbis/config` (ring id, ring public key, policy id), `.orbis/version` (repo format, `git orbis sync` migrates it), `.orbis/readers`, `.orbis/teams` and `.orbis/access` get committed. None of them are secret, it's fine for them to be public.
 
 ## Try it locally
 
@@ -75,6 +79,15 @@ Once per machine:
 export PATH="$HOME/git-orbis/bin:$PATH"   # put it in your shell rc
 git orbis install                             # global filter, zsh completion, creates ~/.ssh/git-orbis, prints your DID
 ```
+
+No rust toolchain? Grab a release instead of cloning. Mac and Linux, amd64 and arm64:
+
+```bash
+v=v1.1.0; os=darwin; arch=arm64   # or linux / amd64
+curl -fsSL "https://github.com/reecepbcups/git-orbis/releases/download/$v/git-orbis-$v-$os-$arch.tar.gz" | tar -xz -C ~
+```
+
+That unpacks to `~/git-orbis`, same PATH line as above. Later on, `git orbis update` checks for a newer release, asks y/n, and only installs it if `SHA256SUMS` is signed by the `release.pub` you already have and the tarball matches it. It won't downgrade you.
 
 After that a plain `git clone` of a repo using git-orbis decrypts on its own. If you got access after cloning, `git orbis refresh`.
 

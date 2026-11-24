@@ -19,6 +19,8 @@ func TestIsPointer(t *testing.T) {
 		want bool
 	}{
 		{"pointer", "orbis-git v1\nobject: abc\n", true},
+		{"v1.1.0 envelope", "orbis-git v1.1.0\nobject: abc\n\nSalted__\x00\xff", true},
+		{"unknown version", "orbis-git v2\nobject: abc\n", false},
 		{"no trailing newline", "orbis-git v1", true},
 		{"plain", "SECRET=1\n", false},
 		{"magic later", "x\norbis-git v1\n", false},

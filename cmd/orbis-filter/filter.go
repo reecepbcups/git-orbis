@@ -9,15 +9,17 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 )
 
-// magic is the first line of every pointer git-orbis commits.
-const magic = "orbis-git v1"
+// magics are the first line of every pointer git-orbis commits. v1 lists chunk
+// objects, v1.1.0 carries the ciphertext so it can be any size.
+var magics = []string{"orbis-git v1", "orbis-git v1.1.0"}
 
-// pointerMax is bigger than any pointer, so larger blobs skip the content read.
-const pointerMax = 256
+// headMax covers the first line of any pointer, the rest of a blob is skipped.
+const headMax = 64
 
 // filter decides which files are plain and passes those straight back.
 // it mirrors protected() in bin/git-orbis and must never pass through a file
@@ -57,7 +59,7 @@ func (f *filter) apply(ctx context.Context, req request) ([]byte, error) {
 
 func isPointer(b []byte) bool {
 	line, _, _ := bytes.Cut(b, []byte("\n"))
-	return string(line) == magic
+	return slices.Contains(magics, string(line))
 }
 
 // protected reports whether path should be encrypted. same rules as the script:
@@ -176,7 +178,7 @@ func (f *filter) indexPointer(path string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("cat-file size %q: %w", line, err)
 	}
-	if fields[1] != "blob" || size > pointerMax {
+	if fields[1] != "blob" {
 		return false, nil
 	}
 	if _, err := fmt.Fprintf(c.in, "contents %s\n", fields[0]); err != nil {
@@ -185,11 +187,15 @@ func (f *filter) indexPointer(path string) (bool, error) {
 	if _, err := c.out.ReadString('\n'); err != nil {
 		return false, err
 	}
-	body := make([]byte, size+1) // trailing newline
-	if _, err := io.ReadFull(c.out, body); err != nil {
+	head := make([]byte, min(size, headMax))
+	if _, err := io.ReadFull(c.out, head); err != nil {
 		return false, fmt.Errorf("cat-file contents: %w", err)
 	}
-	return isPointer(body[:size]), nil
+	// drain the rest plus the trailing newline so the next answer lines up
+	if _, err := io.CopyN(io.Discard, c.out, int64(size-len(head)+1)); err != nil {
+		return false, fmt.Errorf("cat-file contents: %w", err)
+	}
+	return isPointer(head), nil
 }
 
 // runScript hands one file to git-orbis clean|smudge, the slow path.

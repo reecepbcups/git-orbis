@@ -6,7 +6,18 @@ source "$(dirname "$0")/env.sh"
 OUT="${1:-$ROOT/.orbis-ring.env}"
 cli() { "$ORBIS_CLI" "$@"; }
 # node txs fail with "unchanged"/"already" on reruns, that's fine
-idem() { local out; out="$("$ORBIS_CLI" "$@" 2>&1)" || { grep -qiE 'unchanged|already' <<<"$out" || { echo "$out" >&2; return 1; }; }; }
+# nodes register their own node info after they're funded, so right after
+# `make up` it can still be missing. wait for it instead of failing.
+idem() {
+  local out i
+  for i in $(seq 1 60); do
+    out="$("$ORBIS_CLI" "$@" 2>&1)" && return 0
+    grep -qiE 'unchanged|already' <<<"$out" && return 0
+    grep -q 'node info not found' <<<"$out" || break
+    sleep 2
+  done
+  echo "$out" >&2; return 1
+}
 field() { grep "$1" | head -1 | sed "s/.*$1 *//"; }
 
 keys=()

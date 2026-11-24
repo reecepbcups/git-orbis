@@ -13,6 +13,7 @@ cmds=(
   'push-private:push a branch encrypted'
   'fetch-private:decrypt a private branch'
   'private-publish:make a private branch public'
+  'update:install the latest signed release'
 )
 
 if (( CURRENT == 2 )); then
