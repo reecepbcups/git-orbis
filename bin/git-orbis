@@ -19,11 +19,13 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../scripts/env.sh"
-# v1 pointers list chunk objects, v2 pointers carry the ciphertext and one key object.
-# new pointers are always v2, v1 still decrypts.
-MAGIC="orbis-git v2"
-# repo format in .orbis/version. bump it with a migrate_<old> function below.
-VERSION=2
+# v1 pointers list chunk objects, v1.1.0 pointers carry the ciphertext and one key object.
+# new pointers are always v1.1.0, v1 still decrypts.
+MAGIC="orbis-git v1.1.0"
+# repo formats in .orbis/version, oldest first. bump by adding one here and a
+# migrate_<old> function below, dots in <old> become underscores.
+VERSIONS=(1 1.1.0)
+VERSION="${VERSIONS[${#VERSIONS[@]} - 1]}"
 
 die() { echo "git-orbis: $*" >&2; exit 1; }
 cli() { "$ORBIS_CLI" "$@"; }
@@ -102,26 +104,35 @@ repo_file() {
 # repos from before .orbis/version are v1
 repo_version() { local v; v="$(repo_file .orbis/version)"; echo "${v:-1}"; }
 
+# position in VERSIONS. a version we don't know is from a newer git-orbis.
+version_index() { # version
+  local i
+  for i in "${!VERSIONS[@]}"; do [ "${VERSIONS[$i]}" != "$1" ] || { echo "$i"; return; }; done
+  echo "${#VERSIONS[@]}"
+}
+
 # an older git-orbis must not write into a repo a newer one migrated
 check_version() {
   local v; v="$(repo_version)"
-  [ "$v" -le "$VERSION" ] || die "repo is format v$v, this git-orbis only knows v$VERSION, update it"
+  [ "$(version_index "$v")" -lt "${#VERSIONS[@]}" ] || die "repo is format v$v, this git-orbis only knows up to v$VERSION, update it"
 }
 
-# run migrate_1, migrate_2, ... up to VERSION, then record it
+# run each migrate_<old> up to VERSION, then record it
 migrate() {
-  local v; v="$(repo_version)"
+  local v i
   check_version
-  while [ "$v" -lt "$VERSION" ]; do
-    echo "migrating repo v$v -> v$((v + 1))"
-    "migrate_$v"
-    v=$((v + 1))
+  i="$(version_index "$(repo_version)")"
+  while [ "$i" -lt $((${#VERSIONS[@]} - 1)) ]; do
+    v="${VERSIONS[$i]}"
+    echo "migrating repo v$v -> v${VERSIONS[$((i + 1))]}"
+    "migrate_${v//./_}"
+    i=$((i + 1))
   done
   mkdir -p "$(top)/.orbis"
   echo "$VERSION" >"$(top)/.orbis/version"
 }
 
-# v2 pointers are envelopes. nothing to rewrite, old v1 pointers keep decrypting,
+# v1.1.0 pointers are envelopes. nothing to rewrite, old v1 pointers keep decrypting,
 # the bump just stops an older git-orbis from writing here.
 migrate_1() { :; }
 
@@ -137,7 +148,7 @@ team() { # name
   awk '{for (i = 2; i <= NF; i++) print $i}' <<<"$line"
 }
 
-is_pointer() { head -1 | grep -xE "orbis-git v[12]" >/dev/null; }
+is_pointer() { head -1 | grep -xE "orbis-git v1(\.1\.0)?" >/dev/null; }
 
 # line number of the last .orbis/access rule matching path, like CODEOWNERS.
 # git does the pattern matching so it agrees with .gitattributes.
@@ -203,7 +214,7 @@ branch_owners() { # name
 }
 
 # files git stores as pointers. run from the top.
-pointer_files() { git grep --cached -l -e '^orbis-git v[12]$' || [ $? -eq 1 ]; }
+pointer_files() { git grep --cached -l -E -e '^orbis-git v1(\.1\.0)?$' || [ $? -eq 1 ]; }
 
 # grant the current version of every filtered file to whoever may read it.
 # with a did, only that did.
@@ -213,13 +224,13 @@ file_grants() { # [did]
   local only="${1:-}" path ptr oid dids
   cd "$(top)"
   while IFS= read -r path; do
-    # header only, a v2 pointer carries the whole ciphertext
+    # header only, a v1.1.0 pointer carries the whole ciphertext
     ptr="$({ git show ":$path" 2>/dev/null || true; } | head -3)"
     is_pointer <<<"$ptr" || continue
     dids="$(readers_for "$path")" || exit 1
     [ -z "$only" ] || dids="$(grep -xF -- "$only" <<<"$dids" || true)"
     [ -n "$dids" ] || continue
-    # one object per chunk on v1, the key on v2
+    # one object per chunk on v1, the key on v1.1.0
     for oid in $(sed -n 's/^object: //p' <<<"$ptr"); do
       printf '%s\t%s\t%s\n' "$oid" "$(paste -sd, - <<<"$dids")" "$path"
     done
@@ -314,10 +325,10 @@ fetch_chunk() { # oid out
 decrypt() { # pointer_file
   load_config
   [ -n "${ORBIS_READER_DID_PK:-}" ] || return 1
-  if [ "$(head -1 "$1")" = "orbis-git v1" ]; then decrypt_v1 "$1"; else decrypt_v2 "$1"; fi
+  if [ "$(head -1 "$1")" = "orbis-git v1" ]; then decrypt_v1 "$1"; else decrypt_v1_1 "$1"; fi
 }
 
-decrypt_v2() { # pointer_file
+decrypt_v1_1() { # pointer_file
   local oid out plain key sum dir rc=0
   oid="$(head -3 "$1" | sed -n 's/^object: //p')"
   out="$(cli pre --ring-pk "$ORBIS_RING_PK" --object-id "$oid" 2>&1)" || return 1

@@ -5,7 +5,7 @@ Private `.env` files in a normal (even public) git repo.
 Git is all or nothing. If you can clone the repo you can read every file in it. git-orbis lets you commit a secret file to the same repo as your code while only the people you pick can read it. Everyone else, GitHub included, just sees a pointer with ciphertext:
 
 ```text
-orbis-git v2
+orbis-git v1.1.0
 object: 7c438b3a4ccea43321576e74421c7b9cc0bf3baaa8cd207b474508dd0e7b48ee
 
 Salted__<encrypted bytes>
@@ -37,7 +37,7 @@ git add .env
      2. store just that key in orbis (encrypted to the ring's public key)
      3. register it as an object in the ACP policy
      4. grant "reader" to you + whoever .orbis/access says can read this path
-     5. hand git the pointer (orbis-git v2 / object: <id> / the ciphertext)
+     5. hand git the pointer (orbis-git v1.1.0 / object: <id> / the ciphertext)
 
 git checkout / clone / pull
   -> smudge filter

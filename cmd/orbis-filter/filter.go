@@ -15,8 +15,8 @@ import (
 )
 
 // magics are the first line of every pointer git-orbis commits. v1 lists chunk
-// objects, v2 carries the ciphertext so it can be any size.
-var magics = []string{"orbis-git v1", "orbis-git v2"}
+// objects, v1.1.0 carries the ciphertext so it can be any size.
+var magics = []string{"orbis-git v1", "orbis-git v1.1.0"}
 
 // headMax covers the first line of any pointer, the rest of a blob is skipped.
 const headMax = 64
