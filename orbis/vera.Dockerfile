@@ -7,6 +7,12 @@ ARG COMET=github.com/mizufinance/cometbft@v0.38.21-mizu.1
 RUN git clone -q https://github.com/sourcenetwork/vera /app && git -C /app checkout -q $VERA_REV
 WORKDIR /app
 RUN go mod edit -replace github.com/cometbft/cometbft=$COMET && go mod tidy
+# after a restart the sdk checks txs at height 0 until the next block, which
+# breaks sig checks (account number 0). with no empty blocks that block never comes.
+RUN cp -r "$(go list -m -f '{{.Dir}}' github.com/cosmos/cosmos-sdk)" /sdk && chmod -R u+w /sdk && \
+  sed -i 's/emptyHeader := cmtproto.Header{ChainID: app.chainID}/emptyHeader := cmtproto.Header{ChainID: app.chainID, Height: app.LastBlockHeight()}/' /sdk/baseapp/baseapp.go && \
+  grep -q 'Height: app.LastBlockHeight()}' /sdk/baseapp/baseapp.go && \
+  go mod edit -replace github.com/cosmos/cosmos-sdk=/sdk
 RUN --mount=type=cache,target=/root/.cache go build -o /verad ./cmd/verad
 
 FROM debian:bookworm-slim

@@ -26,8 +26,9 @@ services:
           echo "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" | verad keys add test --recover --keyring-backend test --home /home/node/.vera
           echo "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art" | verad keys add funder --recover --keyring-backend test --home /home/node/.vera
           verad genesis add-genesis-account validator 100000000000uopen --keyring-backend test --home /home/node/.vera
-          verad genesis add-genesis-account test 100000000000uopen --keyring-backend test --home /home/node/.vera
-          verad genesis add-genesis-account funder 100000000000uopen --keyring-backend test --home /home/node/.vera
+          # huge balances so a local stack never runs out of fees, a chunk is ~0.28 OPEN
+          verad genesis add-genesis-account test 1000000000000000000000uopen --keyring-backend test --home /home/node/.vera
+          verad genesis add-genesis-account funder 1000000000000000000000uopen --keyring-backend test --home /home/node/.vera
           verad genesis gentx validator 10000000000uopen --keyring-backend test --chain-id vera-localnet --home /home/node/.vera
           verad genesis collect-gentxs --home /home/node/.vera
         fi
@@ -35,6 +36,8 @@ services:
         CFG=/home/node/.vera/config/config.toml
         sed -i 's/^create_empty_blocks = .*/create_empty_blocks = false/; s/^create_empty_blocks_interval = .*/create_empty_blocks_interval = "24h"/' $$CFG
         grep -q '^proof_block_mode' $$CFG || sed -i '/^\[consensus\]/a proof_block_mode = "always"' $$CFG
+        # blocks only come from txs, so commit right away instead of idling 5s per tx
+        sed -i 's/^timeout_commit = .*/timeout_commit = "0s"/' $$CFG
         sed -i 's/^proof_block_mode = .*/proof_block_mode = "only_after_tx"/' $$CFG
         # git-orbis stores 1MB chunks, base64 + ring encryption need room past the 1MB default
         sed -i 's/^max_tx_bytes = .*/max_tx_bytes = 8388608/; s/^max_body_bytes = .*/max_body_bytes = 8388608/' $$CFG
@@ -90,7 +93,7 @@ services:
         until verad query block --type=height 1 --node tcp://vera:26657 >/dev/null 2>&1; do sleep 2; done
         addrs="$$(cat /n1/public_key.txt) $$(cat /n2/public_key.txt) $$(cat /n3/public_key.txt)"
         n=0
-        until out=$$(verad tx bank multi-send funder $$addrs 1000000000uopen \
+        until out=$$(verad tx bank multi-send funder $$addrs 1000000000000000000uopen \
               --keyring-backend test --home "$$H" --chain-id vera-localnet \
               --node tcp://vera:26657 --fees 2000uopen --yes -o json 2>&1) \
               && echo "$$out" | grep -q '"code":0'; do
