@@ -89,7 +89,7 @@ index 8a625155..403bb504 100644
      remove_node_from_whitelist, remove_node_from_whitelist_with_config,
      schedule_ring_upgrade_by_acp, schedule_ring_upgrade_by_acp_with_config,
 diff --git a/bin/cli-tool/src/main.rs b/bin/cli-tool/src/main.rs
-index ab52f4e4..b0e5f572 100644
+index ab52f4e4..6f3c02f8 100644
 --- a/bin/cli-tool/src/main.rs
 +++ b/bin/cli-tool/src/main.rs
 @@ -7,7 +7,7 @@ pub use commands::{
@@ -143,7 +143,20 @@ index ab52f4e4..b0e5f572 100644
      },
      /// Register a bulletin namespace
      RegisterBulletinNamespace {
-@@ -721,6 +749,9 @@ async fn main() -> Result<()> {
+@@ -440,8 +468,11 @@ pub enum SubCommands {
+     /// Store secret by sending it to node (encrypts and stores in one step)
+     StoreSecret {
+         /// Plaintext secret encrypted locally before sending. If omitted, you'll be prompted for it (hidden input).
+-        #[clap(long)]
++        #[clap(long, conflicts_with = "secret_file")]
+         secret: Option<String>,
++        /// Read the secret from a file instead, `-` for stdin. Keeps it out of argv and ps.
++        #[clap(long)]
++        secret_file: Option<String>,
+         /// Ring public key (hex) - used for encryption
+         #[clap(long)]
+         ring_pk_hex: String,
+@@ -721,6 +752,9 @@ async fn main() -> Result<()> {
              )
              .await?;
          }
@@ -153,7 +166,7 @@ index ab52f4e4..b0e5f572 100644
          SubCommands::DeriveSignerDid => {
              let signing_key = network.require_signing_key()?;
              let (public_key, did) = derive_signer_did(&signing_key, network.chain_config())?;
-@@ -754,9 +785,13 @@ async fn main() -> Result<()> {
+@@ -754,9 +788,13 @@ async fn main() -> Result<()> {
              relation,
              reader_did_pk,
              actor_pubkey,
@@ -168,7 +181,7 @@ index ab52f4e4..b0e5f572 100644
              set_relationship_on_chain(
                  policy_id,
                  object_id,
-@@ -768,6 +803,39 @@ async fn main() -> Result<()> {
+@@ -768,6 +806,39 @@ async fn main() -> Result<()> {
              )
              .await?;
          }
@@ -208,6 +221,27 @@ index ab52f4e4..b0e5f572 100644
          SubCommands::RegisterBulletinNamespace { namespace } => {
              let signing_key = network.require_signing_key()?;
              register_bulletin_namespace(namespace, network.chain_config(), &signing_key).await?;
+@@ -933,6 +1004,7 @@ async fn main() -> Result<()> {
+         }
+         SubCommands::StoreSecret {
+             secret,
++            secret_file,
+             ring_pk_hex,
+             ring_id,
+             policy_id,
+@@ -945,7 +1017,11 @@ async fn main() -> Result<()> {
+             derivation,
+             with_proof,
+         } => {
+-            let secret = resolve_secret(secret, "Plaintext secret to store: ")?;
++            let secret = match secret_file.as_deref() {
++                Some("-") => std::io::read_to_string(std::io::stdin()).context("read secret from stdin")?,
++                Some(f) => std::fs::read_to_string(f).with_context(|| format!("read secret file {f}"))?,
++                None => resolve_secret(secret, "Plaintext secret to store: ")?,
++            };
+             let reader_did_pk = require_reader_did_pk(reader_did_pk)?;
+             let derivation_bytes = parse_derivation_hex(derivation)?;
+             do_store_secret(
 diff --git a/crates/common/src/blockchain/cosmos/acp.rs b/crates/common/src/blockchain/cosmos/acp.rs
 index d6024156..b289bbb7 100644
 --- a/crates/common/src/blockchain/cosmos/acp.rs

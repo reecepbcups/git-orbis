@@ -184,11 +184,13 @@ file_grants() { # [did]
   while IFS= read -r path; do
     ptr="$(git show ":$path" 2>/dev/null)" || continue
     is_pointer <<<"$ptr" || continue
-    oid="$(sed -n 's/^object: //p' <<<"$ptr")"
     dids="$(readers_for "$path")" || exit 1
     [ -z "$only" ] || dids="$(grep -xF -- "$only" <<<"$dids" || true)"
     [ -n "$dids" ] || continue
-    printf '%s\t%s\t%s\n' "$oid" "$(paste -sd, - <<<"$dids")" "$path"
+    # one object per chunk
+    for oid in $(sed -n 's/^object: //p' <<<"$ptr"); do
+      printf '%s\t%s\t%s\n' "$oid" "$(paste -sd, - <<<"$dids")" "$path"
+    done
   done < <(pointer_files)
 }
 
@@ -210,19 +212,21 @@ grant_all() { # < file_grants/branch_grants lines
 }
 
 # one tx for the whole list, one block no matter how many readers
-grant() { # [--register] object_id did...
+grant() { # [--register] "object_id..." did...
   local register=
   if [ "$1" = --register ]; then register=--register; shift; fi
-  local oid="$1"; shift
+  local oids="$1"; shift
   local list; list="$(IFS=,; echo "$*")"
-  local out
-  out="$(cli_tx grant-batch --policy-id "$ORBIS_POLICY_ID" --object-id "$oid" --resource document \
-    --actor-dids "$list" $register 2>&1)" || die "grant on $oid failed: $(tail -3 <<<"$out")"
+  local out oid
+  local -a args=()
+  for oid in $oids; do args+=(--grants "$oid=$list"); done
+  out="$(cli_tx grant-batch --policy-id "$ORBIS_POLICY_ID" --resource document "${args[@]}" $register 2>&1)" \
+    || die "grant on $oids failed: $(tail -3 <<<"$out")"
 }
 
 cmd_clean() { # path
-  local tmp sha cached oid b64 out dids
-  tmp="$(mktemp)"; trap 'rm -f "$tmp"' RETURN
+  local tmp sha cached oid oids= out dids part
+  tmp="$(mktemp)"; trap 'rm -f "$tmp" "$tmp".part.*' RETURN
   cat >"$tmp"
   # already a pointer (e.g. someone without access), keep it as is
   if is_pointer <"$tmp" || ! protected "${1:-}"; then cat "$tmp"; return; fi
@@ -235,43 +239,59 @@ cmd_clean() { # path
 
   load_config; need_identity
   dids="$(readers_for "${1:-}")" || exit 1
-  b64="$(base64 <"$tmp" | tr -d '\n')"
-  # TODO: --secret is visible in ps on this machine. fine for a poc.
-  out="$(cli_tx store-secret --secret "$b64" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
-    --policy-id "$ORBIS_POLICY_ID" --resource document --permission read --with-proof 2>&1)" \
-    || die "store-secret failed: $out"
-  oid="$(grep 'Object ID:' <<<"$out" | sed 's/.*Object ID: //')"
-  [ -n "$oid" ] || die "no object id from store-secret"
+  # a tx has a max size, so big files go up as chunks, one object each.
+  # the pointer lists them in order, a small file is a list of one.
+  split -b "${ORBIS_CHUNK_BYTES:-1048576}" "$tmp" "$tmp.part."
+  [ -s "$tmp" ] || : >"$tmp.part.aa"
+  for part in "$tmp".part.??; do
+    base64 <"$part" | tr -d '\n' >"$part.b64"
+    out="$(cli_tx store-secret --secret-file "$part.b64" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
+      --policy-id "$ORBIS_POLICY_ID" --resource document --permission read --with-proof 2>&1)" \
+      || die "store-secret failed: $out"
+    oid="$(grep 'Object ID:' <<<"$out" | sed 's/.*Object ID: //')"
+    [ -n "$oid" ] || die "no object id from store-secret"
+    oids="$oids $oid"
+  done
 
   # register + every reader (you included) land in one block
-  grant --register "$oid" $(printf '%s\n' "$(whoami_did)" $dids | sort -u)
+  grant --register "$oids" $(printf '%s\n' "$(whoami_did)" $dids | sort -u)
 
-  printf '%s\nobject: %s\n' "$MAGIC" "$oid" | tee "$cached"
+  { echo "$MAGIC"; for oid in $oids; do echo "object: $oid"; done; } | tee "$cached"
 }
 
 cache_key() { { printf '%s\0' "$1"; cat "$2"; } | shasum -a 256 | cut -d' ' -f1; }
 
+# plaintext of a pointer on stdout. fails without access, printing nothing.
+decrypt() { # pointer_file
+  local oid out plain buf rc=0
+  load_config
+  [ -n "${ORBIS_READER_DID_PK:-}" ] || return 1
+  # every chunk or nothing, half a file is worse than the pointer
+  buf="$(mktemp)"
+  for oid in $(sed -n 's/^object: //p' "$1"); do
+    out="$(cli pre --ring-pk "$ORBIS_RING_PK" --object-id "$oid" 2>&1)" \
+      && plain="$(grep 'Decrypted Secret:' <<<"$out" | sed 's/.*Decrypted Secret: //')" \
+      && [ -n "$plain" ] && base64 -d <<<"$plain" >>"$buf" || { rc=1; break; }
+  done
+  [ $rc -ne 0 ] || cat "$buf"
+  rm -f "$buf"; return $rc
+}
+
 cmd_smudge() {
-  local tmp oid out plain sha
-  tmp="$(mktemp)"; trap 'rm -f "$tmp"' RETURN
+  local tmp sha
+  tmp="$(mktemp)"; trap 'rm -f "$tmp" "$tmp.plain"' RETURN
   cat >"$tmp"
   if ! is_pointer <"$tmp"; then cat "$tmp"; return; fi
 
-  oid="$(sed -n 's/^object: //p' "$tmp")"
-  load_config
   # no access shouldn't break checkout. leave the pointer in place.
-  if [ -z "${ORBIS_READER_DID_PK:-}" ] \
-    || ! out="$(cli pre --ring-pk "$ORBIS_RING_PK" --object-id "$oid" 2>&1)" \
-    || ! plain="$(grep 'Decrypted Secret:' <<<"$out" | sed 's/.*Decrypted Secret: //')" \
-    || [ -z "$plain" ]; then
-    echo "git-orbis: no access to ${1:-file} (object $oid), leaving pointer" >&2
+  if ! decrypt "$tmp" >"$tmp.plain"; then
+    echo "git-orbis: no access to ${1:-file} (object $(sed -n 's/^object: //p' "$tmp" | head -1)), leaving pointer" >&2
     cat "$tmp"; return
   fi
   # remember plaintext -> pointer so clean gives back the exact same blob
-  base64 -d <<<"$plain" | tee "$tmp.plain"
+  cat "$tmp.plain"
   sha="$(cache_key "${1:-}" "$tmp.plain")"
   cp "$tmp" "$(cache_dir)/$sha"
-  rm -f "$tmp.plain"
 }
 
 whoami_did() { need_identity; cli reader-did | cut -d= -f2; }

@@ -17,7 +17,8 @@ import (
 const magic = "orbis-git v1"
 
 // pointerMax is bigger than any pointer, so larger blobs skip the content read.
-const pointerMax = 256
+// a pointer is one object line per chunk, this fits ~900 of them.
+const pointerMax = 64 << 10
 
 // filter decides which files are plain and passes those straight back.
 // it mirrors protected() in bin/git-orbis and must never pass through a file
