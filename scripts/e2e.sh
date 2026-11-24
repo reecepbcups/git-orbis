@@ -50,7 +50,7 @@ git push -q origin main
 
 echo "==> what github sees"
 blob="$(git -C "$W/origin.git" show main:.env)"
-head -1 <<<"$blob" | grep -qx "orbis-git v2" && ok "committed .env is a pointer" || fail "not a pointer: $blob"
+head -1 <<<"$blob" | grep -qx "orbis-git v1.1.0" && ok "committed .env is a pointer" || fail "not a pointer: $blob"
 git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -qE 'hunter2|DEBUG=1|topsecret' \
   && fail "plaintext leaked into remote objects" || ok "no plaintext in any remote object"
 [ "$(cat .env)" = "$(printf '%s\nAPI_KEY=abc123' "$SECRET1")" ] && ok "alice working copy still plaintext" || fail "alice .env changed"
@@ -64,16 +64,16 @@ printf 'LEAK=plain-leak\n' > .env.leak
 git update-index --add --cacheinfo "100644,$(git hash-object -w --no-filters .env.leak),.env.leak"
 git orbis status >/dev/null 2>&1 && fail "status missed plaintext .env.leak" || ok "status flags plaintext .env.leak"
 git orbis status -f >/dev/null
-head -1 <(git show :.env.leak) | grep -qx "orbis-git v2" && ok "status -f re-adds it encrypted" || fail "still plaintext: $(git show :.env.leak)"
+head -1 <(git show :.env.leak) | grep -qx "orbis-git v1.1.0" && ok "status -f re-adds it encrypted" || fail "still plaintext: $(git show :.env.leak)"
 git orbis status >/dev/null && ok "status clean after -f" || fail "status still unhappy"
 gitq alice commit -qm "fix leak"
 git log -p -1 -- .env.leak | grep -q plain-leak && ok "git log -p shows plaintext via textconv" || fail "textconv: $(git log -p -1 -- .env.leak)"
 
 echo "==> repo format version"
-[ "$(cat .orbis/version)" = 2 ] && ok "sync wrote .orbis/version" || fail "version: $(cat .orbis/version 2>&1)"
+[ "$(cat .orbis/version)" = 1.1.0 ] && ok "sync wrote .orbis/version" || fail "version: $(cat .orbis/version 2>&1)"
 echo 99 > .orbis/version
 git orbis sync >/dev/null 2>&1 && fail "sync ran on a newer repo format" || ok "sync refuses newer repo format"
-echo 1 > .orbis/version
+echo 1.1.0 > .orbis/version
 
 echo "==> new rule works without sync"
 echo '.secrets/*  @all' >> .orbis/access
@@ -92,12 +92,12 @@ grep -q hunter2 "$W/bob/.env" && ok "bob decrypts .env" || fail "bob got: $(cat 
   && ok ".env.blob stored as one envelope" || fail "envelope: $(git -C "$W/origin.git" show main:.env.blob | head -3)"
 cmp -s "$W/alice/.env.blob" "$W/bob/.env.blob" && ok "bob decrypts 120KB binary .env.blob" || fail "bob .env.blob differs"
 grep -q DEBUG=1 "$W/bob/.env.development" && ok "bob decrypts .env.development" || fail "bob dev: $(cat "$W/bob/.env.development")"
-head -1 "$W/bob/.env.production" | grep -qx "orbis-git v2" && ok "bob (not ops) can't read .env.production" || fail "bob read prod"
+head -1 "$W/bob/.env.production" | grep -qx "orbis-git v1.1.0" && ok "bob (not ops) can't read .env.production" || fail "bob read prod"
 [ -z "$(as bob git status --porcelain)" ] && ok "bob tree clean" || fail "bob dirty"
 
 echo "==> mallory (not a reader) clones"
 clone mallory 2>"$W/mallory.err"
-head -1 "$W/mallory/.env" | grep -qx "orbis-git v2" && ok "mallory only sees pointer" || fail "mallory got: $(cat "$W/mallory/.env")"
+head -1 "$W/mallory/.env" | grep -qx "orbis-git v1.1.0" && ok "mallory only sees pointer" || fail "mallory got: $(cat "$W/mallory/.env")"
 grep -q "no access" "$W/mallory.err" && ok "mallory told she has no access" || fail "no warning for mallory"
 [ -z "$(as mallory git status --porcelain)" ] && ok "mallory tree clean" || fail "mallory dirty"
 as mallory git log -p -- .env 2>/dev/null | grep -q hunter2 && fail "mallory diff shows plaintext" || ok "mallory diff only shows pointers"
@@ -123,7 +123,7 @@ gitq alice commit -qam "add carol to ops"
 git push -q origin main
 clone carol 2>/dev/null
 grep -q topsecret "$W/carol/.env.production" && ok "carol decrypts .env.production" || fail "carol got: $(cat "$W/carol/.env.production")"
-head -1 "$W/carol/.env" | grep -qx "orbis-git v2" && ok "carol (not @all) can't read .env" || fail "carol read .env"
+head -1 "$W/carol/.env" | grep -qx "orbis-git v1.1.0" && ok "carol (not @all) can't read .env" || fail "carol read .env"
 
 echo "==> alice pushes a private branch for @ops"
 cd "$W/alice"
@@ -181,5 +181,40 @@ git -C "$W/origin.git" show launch:land.go | grep -q PRIVATE_PLAIN_PUSH \
   && ok "launch is public plaintext" || fail "launch not public"
 git -C "$W/origin.git" rev-parse -q --verify refs/heads/feat-x >/dev/null \
   && fail "feat-x stub still on remote" || ok "encrypted feat-x removed"
+
+echo "==> a v1 repo from an older git-orbis migrates"
+# last commit before envelope pointers, built from source like a user still on it
+OLD_REV=d58541ade3909f2e326bf8be63038c93a7b4917a
+OLD="$W/old-git-orbis"
+git -C "$ROOT" cat-file -e "$OLD_REV^{commit}" 2>/dev/null || git -C "$ROOT" fetch -q --depth 1 origin "$OLD_REV"
+mkdir "$OLD"; git -C "$ROOT" archive "$OLD_REV" | tar -x -C "$OLD"
+(cd "$OLD" && go build -o .tools/bin/orbis-filter ./cmd/orbis-filter)
+git init -q --bare -b main "$W/v1-origin.git"
+mkdir "$W/v1"; cd "$W/v1"; git init -q -b main
+git remote add origin "$W/v1-origin.git"
+"$OLD/bin/git-orbis" init >/dev/null
+mkdir .orbis; cp "$ROOT/.orbis-ring.env" .orbis/config
+printf '# alice\n%s\n# bob\n%s\n' "$(did alice)" "$(did bob)" > .orbis/readers
+printf '.env  @all\n' > .orbis/access
+"$OLD/bin/git-orbis" sync >/dev/null
+echo "LEGACY=from-v1" > .env
+git add -A; gitq alice commit -qm "v1 repo"; git push -q origin main
+head -1 <(git show :.env) | grep -qx "orbis-git v1" && ok "old git-orbis writes a v1 pointer" || fail "not v1: $(git show :.env | head -1)"
+
+git orbis init >/dev/null # filter now runs the current git-orbis
+out="$(git orbis sync)"
+grep -q 'migrating repo v1 -> v1.1.0' <<<"$out" && [ "$(cat .orbis/version)" = 1.1.0 ] \
+  && ok "sync migrates the repo v1 -> v1.1.0" || fail "migrate: $out / $(cat .orbis/version)"
+git add .orbis/version; gitq alice commit -qm "migrate"; git push -q origin main
+"$OLD/bin/git-orbis" sync >/dev/null 2>&1 && fail "old git-orbis wrote to a v1.1.0 repo" || ok "old git-orbis refuses the migrated repo"
+
+git clone -q --no-checkout "$W/v1-origin.git" "$W/v1-bob"
+(cd "$W/v1-bob" && ORBIS_READER_DID_PK=bob git orbis init >/dev/null && ORBIS_READER_DID_PK=bob git checkout -q main)
+grep -qx LEGACY=from-v1 "$W/v1-bob/.env" && ok "bob decrypts the v1 pointer with the new git-orbis" || fail "bob v1: $(head -2 "$W/v1-bob/.env")"
+echo "LEGACY=rotated" > .env
+git add .env; gitq alice commit -qm "rotate"; git push -q origin main
+head -1 <(git show :.env) | grep -qx "orbis-git v1.1.0" && ok "an edit after migrating writes v1.1.0" || fail "not v1.1.0: $(git show :.env | head -1)"
+(cd "$W/v1-bob" && ORBIS_READER_DID_PK=bob git pull -q --ff-only)
+grep -qx LEGACY=rotated "$W/v1-bob/.env" && ok "bob reads the v1.1.0 update" || fail "bob v1.1.0: $(head -2 "$W/v1-bob/.env")"
 
 echo "PASS ($pass checks)"
