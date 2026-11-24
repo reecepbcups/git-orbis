@@ -412,7 +412,7 @@ cmd_status() { # [-f]
         }
       }')"
   [ -n "$out" ] || { echo "nothing covered by .orbis/access"; return 0; }
-  awk -F'\t' '{ printf "%14s  %s\n", $1 == "encrypted" ? "encrypted" : $1 == "plaintext" ? "NOT ENCRYPTED" : "NO FILTER", $2 }' <<<"$out"
+  awk -F'\t' '{ printf "%14s  %s\n", ($1 == "encrypted" ? "encrypted" : $1 == "plaintext" ? "NOT ENCRYPTED" : "NO FILTER"), $2 }' <<<"$out"
 
   if grep -q '^nofilter' <<<"$out"; then
     echo "git-orbis: .gitattributes doesn't send these through the filter, run 'git orbis sync'" >&2
