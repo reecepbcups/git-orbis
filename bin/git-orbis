@@ -236,7 +236,8 @@ grant_all() { # < file_grants/branch_grants lines
   done
 }
 
-# one tx for the whole list, one block no matter how many readers
+# one tx per 200 objects, one block no matter how many readers.
+# bigger batches go over the rpc body limit.
 grant() { # [--register] "object_id..." did...
   local register=
   if [ "$1" = --register ]; then register=--register; shift; fi
@@ -244,9 +245,25 @@ grant() { # [--register] "object_id..." did...
   local list; list="$(IFS=,; echo "$*")"
   local out oid
   local -a args=()
-  for oid in $oids; do args+=(--grants "$oid=$list"); done
+  for oid in $oids; do
+    args+=(--grants "$oid=$list")
+    [ ${#args[@]} -lt 200 ] || { grant_tx; args=(); }
+  done
+  [ ${#args[@]} -eq 0 ] || grant_tx
+}
+grant_tx() { # uses grant's args and register
   out="$(cli_tx grant-batch --policy-id "$ORBIS_POLICY_ID" --resource document "${args[@]}" $register 2>&1)" \
-    || die "grant on $oids failed: $(tail -3 <<<"$out")"
+    || die "grant on ${#args[@]} objects failed: $(tail -3 <<<"$out")"
+}
+
+# ciphertext object id in <part>.oid, or the cli output in <part>.err
+store_chunk() { # part
+  local out
+  base64 <"$1" | tr -d '\n' >"$1.b64"
+  out="$(cli_tx store-secret --secret-file "$1.b64" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
+    --policy-id "$ORBIS_POLICY_ID" --resource document --permission read --with-proof 2>&1)" \
+    && grep 'Object ID:' <<<"$out" | sed 's/.*Object ID: //' >"$1.oid" \
+    || echo "$out" >"$1.err"
 }
 
 cmd_clean() { # path
@@ -267,16 +284,18 @@ cmd_clean() { # path
   # a tx has a max size, so big files go up as chunks, one object each.
   # the pointer lists them in order, a small file is a list of one.
   # 48KB since a chunk is ~4.8x bigger on the wire and nodes cap requests at 256KB.
-  split -b "${ORBIS_CHUNK_BYTES:-49152}" "$tmp" "$tmp.part."
-  [ -s "$tmp" ] || : >"$tmp.part.aa"
-  for part in "$tmp".part.??; do
-    base64 <"$part" | tr -d '\n' >"$part.b64"
-    out="$(cli_tx store-secret --secret-file "$part.b64" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
-      --policy-id "$ORBIS_POLICY_ID" --resource document --permission read --with-proof 2>&1)" \
-      || die "store-secret failed: $out"
-    oid="$(grep 'Object ID:' <<<"$out" | sed 's/.*Object ID: //')"
-    [ -n "$oid" ] || die "no object id from store-secret"
-    oids="$oids $oid"
+  split -a 4 -b "${ORBIS_CHUNK_BYTES:-49152}" "$tmp" "$tmp.part."
+  [ -s "$tmp" ] || : >"$tmp.part.aaaa"
+  # each chunk is its own tx, so upload ORBIS_PARALLEL at a time
+  local n=0 par="${ORBIS_PARALLEL:-8}"
+  for part in "$tmp".part.????; do
+    store_chunk "$part" &
+    n=$((n + 1)); [ $((n % par)) -ne 0 ] || wait
+  done
+  wait
+  for part in "$tmp".part.????; do
+    [ -s "$part.oid" ] || die "store-secret failed: $(cat "$part.err" 2>/dev/null)"
+    oids="$oids $(cat "$part.oid")"
   done
 
   # register + every reader (you included) land in one block
