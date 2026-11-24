@@ -83,7 +83,7 @@ git orbis install                             # global filter, zsh completion, c
 No rust toolchain? Grab a release instead of cloning. Mac and Linux, amd64 and arm64:
 
 ```bash
-v=v1.1.0; os=darwin; arch=arm64   # or linux / amd64
+v=v1.1.1; os=darwin; arch=arm64   # or linux / amd64
 curl -fsSL "https://github.com/reecepbcups/git-orbis/releases/download/$v/git-orbis-$v-$os-$arch.tar.gz" | tar -xz -C ~
 ```
 
