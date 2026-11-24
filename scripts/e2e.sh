@@ -42,7 +42,7 @@ printf '%s\nAPI_KEY=abc123\n' "$SECRET1" > .env
 echo "DEBUG=1" > .env.development
 echo "$PROD" > .env.production
 echo "hello" > README.md
-# 120KB of binary, 3 chunks at the default 48KB
+# 120KB of binary, one key on orbis and the ciphertext in the pointer
 head -c 120000 /dev/urandom > .env.blob
 git add -A
 gitq alice commit -qm "init with encrypted env"
@@ -50,7 +50,7 @@ git push -q origin main
 
 echo "==> what github sees"
 blob="$(git -C "$W/origin.git" show main:.env)"
-head -1 <<<"$blob" | grep -qx "orbis-git v1" && ok "committed .env is a pointer" || fail "not a pointer: $blob"
+head -1 <<<"$blob" | grep -qx "orbis-git v2" && ok "committed .env is a pointer" || fail "not a pointer: $blob"
 git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -qE 'hunter2|DEBUG=1|topsecret' \
   && fail "plaintext leaked into remote objects" || ok "no plaintext in any remote object"
 [ "$(cat .env)" = "$(printf '%s\nAPI_KEY=abc123' "$SECRET1")" ] && ok "alice working copy still plaintext" || fail "alice .env changed"
@@ -64,13 +64,13 @@ printf 'LEAK=plain-leak\n' > .env.leak
 git update-index --add --cacheinfo "100644,$(git hash-object -w --no-filters .env.leak),.env.leak"
 git orbis status >/dev/null 2>&1 && fail "status missed plaintext .env.leak" || ok "status flags plaintext .env.leak"
 git orbis status -f >/dev/null
-head -1 <(git show :.env.leak) | grep -qx "orbis-git v1" && ok "status -f re-adds it encrypted" || fail "still plaintext: $(git show :.env.leak)"
+head -1 <(git show :.env.leak) | grep -qx "orbis-git v2" && ok "status -f re-adds it encrypted" || fail "still plaintext: $(git show :.env.leak)"
 git orbis status >/dev/null && ok "status clean after -f" || fail "status still unhappy"
 gitq alice commit -qm "fix leak"
 git log -p -1 -- .env.leak | grep -q plain-leak && ok "git log -p shows plaintext via textconv" || fail "textconv: $(git log -p -1 -- .env.leak)"
 
 echo "==> repo format version"
-[ "$(cat .orbis/version)" = 1 ] && ok "sync wrote .orbis/version" || fail "version: $(cat .orbis/version 2>&1)"
+[ "$(cat .orbis/version)" = 2 ] && ok "sync wrote .orbis/version" || fail "version: $(cat .orbis/version 2>&1)"
 echo 99 > .orbis/version
 git orbis sync >/dev/null 2>&1 && fail "sync ran on a newer repo format" || ok "sync refuses newer repo format"
 echo 1 > .orbis/version
@@ -87,15 +87,17 @@ git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -q staging-on
 echo "==> bob (reader) clones"
 clone bob
 grep -q hunter2 "$W/bob/.env" && ok "bob decrypts .env" || fail "bob got: $(cat "$W/bob/.env")"
-[ "$(git -C "$W/origin.git" show main:.env.blob | grep -c '^object: ')" = 3 ] && ok ".env.blob stored as 3 chunks" || fail "chunks: $(git -C "$W/origin.git" show main:.env.blob)"
+[ "$(git -C "$W/origin.git" show main:.env.blob | head -3 | grep -c '^object: ')" = 1 ] \
+  && [ "$(git -C "$W/origin.git" show main:.env.blob | wc -c)" -gt 120000 ] \
+  && ok ".env.blob stored as one envelope" || fail "envelope: $(git -C "$W/origin.git" show main:.env.blob | head -3)"
 cmp -s "$W/alice/.env.blob" "$W/bob/.env.blob" && ok "bob decrypts 120KB binary .env.blob" || fail "bob .env.blob differs"
 grep -q DEBUG=1 "$W/bob/.env.development" && ok "bob decrypts .env.development" || fail "bob dev: $(cat "$W/bob/.env.development")"
-head -1 "$W/bob/.env.production" | grep -qx "orbis-git v1" && ok "bob (not ops) can't read .env.production" || fail "bob read prod"
+head -1 "$W/bob/.env.production" | grep -qx "orbis-git v2" && ok "bob (not ops) can't read .env.production" || fail "bob read prod"
 [ -z "$(as bob git status --porcelain)" ] && ok "bob tree clean" || fail "bob dirty"
 
 echo "==> mallory (not a reader) clones"
 clone mallory 2>"$W/mallory.err"
-head -1 "$W/mallory/.env" | grep -qx "orbis-git v1" && ok "mallory only sees pointer" || fail "mallory got: $(cat "$W/mallory/.env")"
+head -1 "$W/mallory/.env" | grep -qx "orbis-git v2" && ok "mallory only sees pointer" || fail "mallory got: $(cat "$W/mallory/.env")"
 grep -q "no access" "$W/mallory.err" && ok "mallory told she has no access" || fail "no warning for mallory"
 [ -z "$(as mallory git status --porcelain)" ] && ok "mallory tree clean" || fail "mallory dirty"
 as mallory git log -p -- .env 2>/dev/null | grep -q hunter2 && fail "mallory diff shows plaintext" || ok "mallory diff only shows pointers"
@@ -121,7 +123,7 @@ gitq alice commit -qam "add carol to ops"
 git push -q origin main
 clone carol 2>/dev/null
 grep -q topsecret "$W/carol/.env.production" && ok "carol decrypts .env.production" || fail "carol got: $(cat "$W/carol/.env.production")"
-head -1 "$W/carol/.env" | grep -qx "orbis-git v1" && ok "carol (not @all) can't read .env" || fail "carol read .env"
+head -1 "$W/carol/.env" | grep -qx "orbis-git v2" && ok "carol (not @all) can't read .env" || fail "carol read .env"
 
 echo "==> alice pushes a private branch for @ops"
 cd "$W/alice"

@@ -19,9 +19,11 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../scripts/env.sh"
-MAGIC="orbis-git v1"
+# v1 pointers list chunk objects, v2 pointers carry the ciphertext and one key object.
+# new pointers are always v2, v1 still decrypts.
+MAGIC="orbis-git v2"
 # repo format in .orbis/version. bump it with a migrate_<old> function below.
-VERSION=1
+VERSION=2
 
 die() { echo "git-orbis: $*" >&2; exit 1; }
 cli() { "$ORBIS_CLI" "$@"; }
@@ -119,6 +121,10 @@ migrate() {
   echo "$VERSION" >"$(top)/.orbis/version"
 }
 
+# v2 pointers are envelopes. nothing to rewrite, old v1 pointers keep decrypting,
+# the bump just stops an older git-orbis from writing here.
+migrate_1() { :; }
+
 # branch: rules are for private branches, never files
 access_rules() { repo_file .orbis/access | grep -v '^[[:space:]]*#' | awk 'NF && $1 !~ /^branch:/' || true; }
 branch_rules() { repo_file .orbis/access | awk '$1 ~ /^branch:/' || true; }
@@ -131,7 +137,7 @@ team() { # name
   awk '{for (i = 2; i <= NF; i++) print $i}' <<<"$line"
 }
 
-is_pointer() { head -1 | grep -xF "$MAGIC" >/dev/null; }
+is_pointer() { head -1 | grep -xE "orbis-git v[12]" >/dev/null; }
 
 # line number of the last .orbis/access rule matching path, like CODEOWNERS.
 # git does the pattern matching so it agrees with .gitattributes.
@@ -197,7 +203,7 @@ branch_owners() { # name
 }
 
 # files git stores as pointers. run from the top.
-pointer_files() { git grep --cached -l -e "^$MAGIC\$" || [ $? -eq 1 ]; }
+pointer_files() { git grep --cached -l -e '^orbis-git v[12]$' || [ $? -eq 1 ]; }
 
 # grant the current version of every filtered file to whoever may read it.
 # with a did, only that did.
@@ -207,12 +213,13 @@ file_grants() { # [did]
   local only="${1:-}" path ptr oid dids
   cd "$(top)"
   while IFS= read -r path; do
-    ptr="$(git show ":$path" 2>/dev/null)" || continue
+    # header only, a v2 pointer carries the whole ciphertext
+    ptr="$({ git show ":$path" 2>/dev/null || true; } | head -3)"
     is_pointer <<<"$ptr" || continue
     dids="$(readers_for "$path")" || exit 1
     [ -z "$only" ] || dids="$(grep -xF -- "$only" <<<"$dids" || true)"
     [ -n "$dids" ] || continue
-    # one object per chunk
+    # one object per chunk on v1, the key on v2
     for oid in $(sed -n 's/^object: //p' <<<"$ptr"); do
       printf '%s\t%s\t%s\n' "$oid" "$(paste -sd, - <<<"$dids")" "$path"
     done
@@ -256,19 +263,9 @@ grant_tx() { # uses grant's args and register
     || die "grant on ${#args[@]} objects failed: $(tail -3 <<<"$out")"
 }
 
-# ciphertext object id in <part>.oid, or the cli output in <part>.err
-store_chunk() { # part
-  local out
-  base64 <"$1" | tr -d '\n' >"$1.b64"
-  out="$(cli_tx store-secret --secret-file "$1.b64" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
-    --policy-id "$ORBIS_POLICY_ID" --resource document --permission read --with-proof 2>&1)" \
-    && grep 'Object ID:' <<<"$out" | sed 's/.*Object ID: //' >"$1.oid" \
-    || echo "$out" >"$1.err"
-}
-
 cmd_clean() { # path
-  local tmp sha cached oid oids= out dids part
-  tmp="$(mktemp)"; trap 'rm -f "$tmp" "$tmp".part.*' RETURN
+  local tmp sha cached oid out dids key sum
+  tmp="$(mktemp)"; trap 'rm -f "$tmp" "$tmp".*' RETURN
   cat >"$tmp"
   # already a pointer (e.g. someone without access), keep it as is
   if is_pointer <"$tmp" || ! protected "${1:-}"; then cat "$tmp"; return; fi
@@ -281,27 +278,26 @@ cmd_clean() { # path
 
   load_config; need_identity; check_version
   dids="$(readers_for "${1:-}")" || exit 1
-  # a tx has a max size, so big files go up as chunks, one object each.
-  # the pointer lists them in order, a small file is a list of one.
-  # 48KB since a chunk is ~4.8x bigger on the wire and nodes cap requests at 256KB.
-  split -a 4 -b "${ORBIS_CHUNK_BYTES:-49152}" "$tmp" "$tmp.part."
-  [ -s "$tmp" ] || : >"$tmp.part.aaaa"
-  # each chunk is its own tx, so upload ORBIS_PARALLEL at a time
-  local n=0 par="${ORBIS_PARALLEL:-16}"
-  for part in "$tmp".part.????; do
-    store_chunk "$part" &
-    n=$((n + 1)); [ $((n % par)) -ne 0 ] || wait
-  done
-  wait
-  for part in "$tmp".part.????; do
-    [ -s "$part.oid" ] || die "store-secret failed: $(cat "$part.err" 2>/dev/null)"
-    oids="$oids $(cat "$part.oid")"
-  done
+  # envelope: a fresh key encrypts the file here and only the key goes to orbis,
+  # so any size is one tx. the ciphertext lives in the pointer.
+  key="$(openssl rand -hex 32)"
+  sum="$(shasum -a 256 <"$tmp" | cut -d' ' -f1)"
+  # key over fd so it stays out of ps
+  openssl enc -aes-256-cbc -pbkdf2 -salt -pass fd:3 -in "$tmp" -out "$tmp.enc" 3<<<"$key" \
+    || die "encrypt failed"
+  # sha256 rides along with the key so decrypt can tell if the ciphertext was swapped
+  (umask 077; printf '%s %s' "$key" "$sum" | base64 | tr -d '\n' >"$tmp.key")
+  out="$(cli_tx store-secret --secret-file "$tmp.key" --ring-pk-hex "$ORBIS_RING_PK" --ring-id "$ORBIS_RING_ID" \
+    --policy-id "$ORBIS_POLICY_ID" --resource document --permission read --with-proof 2>&1)" \
+    || die "store-secret failed: $out"
+  oid="$(grep 'Object ID:' <<<"$out" | sed 's/.*Object ID: //')"
+  [ -n "$oid" ] || die "no object id from store-secret"
 
   # register + every reader (you included) land in one block
-  grant --register "$oids" $(printf '%s\n' "$(whoami_did)" $dids | sort -u)
+  grant --register "$oid" $(printf '%s\n' "$(whoami_did)" $dids | sort -u)
 
-  { echo "$MAGIC"; for oid in $oids; do echo "object: $oid"; done; } | tee "$cached"
+  # header, blank line, then the raw ciphertext
+  { printf '%s\nobject: %s\n\n' "$MAGIC" "$oid"; cat "$tmp.enc"; } | tee "$cached"
 }
 
 cache_key() { { printf '%s\0' "$1"; cat "$2"; } | shasum -a 256 | cut -d' ' -f1; }
@@ -316,9 +312,29 @@ fetch_chunk() { # oid out
 
 # plaintext of a pointer on stdout. fails without access, printing nothing.
 decrypt() { # pointer_file
-  local oid dir i=0 j rc=0 par="${ORBIS_PARALLEL:-16}"
   load_config
   [ -n "${ORBIS_READER_DID_PK:-}" ] || return 1
+  if [ "$(head -1 "$1")" = "orbis-git v1" ]; then decrypt_v1 "$1"; else decrypt_v2 "$1"; fi
+}
+
+decrypt_v2() { # pointer_file
+  local oid out plain key sum dir rc=0
+  oid="$(head -3 "$1" | sed -n 's/^object: //p')"
+  out="$(cli pre --ring-pk "$ORBIS_RING_PK" --object-id "$oid" 2>&1)" || return 1
+  plain="$(grep 'Decrypted Secret:' <<<"$out" | sed 's/.*Decrypted Secret: //')"
+  [ -n "$plain" ] || return 1
+  # no trailing newline, so read returns 1 even when it worked
+  read -r key sum < <(base64 -d <<<"$plain") || true
+  [ -n "$key" ] && [ -n "$sum" ] || return 1
+  dir="$(mktemp -d)"
+  tail -n +4 "$1" | openssl enc -d -aes-256-cbc -pbkdf2 -pass fd:3 -out "$dir/plain" 3<<<"$key" \
+    && [ "$(shasum -a 256 <"$dir/plain" | cut -d' ' -f1)" = "$sum" ] || rc=1
+  [ $rc -ne 0 ] || cat "$dir/plain"
+  rm -rf "$dir"; return $rc
+}
+
+decrypt_v1() { # pointer_file
+  local oid dir i=0 j rc=0 par="${ORBIS_PARALLEL:-16}"
   dir="$(mktemp -d)"; : >"$dir/plain"
   # chunks come back ORBIS_PARALLEL at a time, numbered so they join in order
   for oid in $(sed -n 's/^object: //p' "$1"); do
@@ -343,7 +359,7 @@ cmd_smudge() {
 
   # no access shouldn't break checkout. leave the pointer in place.
   if ! decrypt "$tmp" >"$tmp.plain"; then
-    echo "git-orbis: no access to ${1:-file} (object $(sed -n 's/^object: //p' "$tmp" | head -1)), leaving pointer" >&2
+    echo "git-orbis: no access to ${1:-file} (object $(head -3 "$tmp" | sed -n 's/^object: //p' | head -1)), leaving pointer" >&2
     cat "$tmp"; return
   fi
   # remember plaintext -> pointer so clean gives back the exact same blob
