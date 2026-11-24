@@ -20,6 +20,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/../scripts/env.sh"
 MAGIC="orbis-git v1"
+# repo format in .orbis/version. bump it with a migrate_<old> function below.
+VERSION=1
 
 die() { echo "git-orbis: $*" >&2; exit 1; }
 cli() { "$ORBIS_CLI" "$@"; }
@@ -93,6 +95,28 @@ repo_file() {
   local f; f="$(top)/$1"
   if [ -f "$f" ]; then cat "$f"; return; fi
   git show ":$1" 2>/dev/null || git show "HEAD:$1" 2>/dev/null || true
+}
+
+# repos from before .orbis/version are v1
+repo_version() { local v; v="$(repo_file .orbis/version)"; echo "${v:-1}"; }
+
+# an older git-orbis must not write into a repo a newer one migrated
+check_version() {
+  local v; v="$(repo_version)"
+  [ "$v" -le "$VERSION" ] || die "repo is format v$v, this git-orbis only knows v$VERSION, update it"
+}
+
+# run migrate_1, migrate_2, ... up to VERSION, then record it
+migrate() {
+  local v; v="$(repo_version)"
+  check_version
+  while [ "$v" -lt "$VERSION" ]; do
+    echo "migrating repo v$v -> v$((v + 1))"
+    "migrate_$v"
+    v=$((v + 1))
+  done
+  mkdir -p "$(top)/.orbis"
+  echo "$VERSION" >"$(top)/.orbis/version"
 }
 
 # branch: rules are for private branches, never files
@@ -238,7 +262,7 @@ cmd_clean() { # path
   cached="$(cache_dir)/$sha"
   if [ -f "$cached" ]; then cat "$cached"; return; fi
 
-  load_config; need_identity
+  load_config; need_identity; check_version
   dids="$(readers_for "${1:-}")" || exit 1
   # a tx has a max size, so big files go up as chunks, one object each.
   # the pointer lists them in order, a small file is a list of one.
@@ -458,6 +482,7 @@ cmd_access() { # pattern owner...
 cmd_sync() {
   local f tmp list
   [ -n "$(access_rules)" ] || die "no rules in .orbis/access"
+  migrate
   f="$(top)/.gitattributes"; tmp="$(mktemp)"
   # old per pattern lines are covered by *
   [ ! -f "$f" ] || sed -e '/^# git-orbis begin/,/^# git-orbis end/d' \
@@ -484,7 +509,7 @@ cmd_push_private() { # branch [remote] [base]
   local name="${1:-}" remote="${2:-origin}" base="${3:-}" b dids tmp key sum b64 out oid meta blob tree commit url
   [ -n "$name" ] || die "usage: git orbis push-private <branch> [remote] [base]"
   git rev-parse -q --verify "refs/heads/$name" >/dev/null || die "no local branch $name"
-  load_config; need_identity
+  load_config; need_identity; check_version
   dids="$(readers_for_branch "$name")" || exit 1
   # base has to be on the remote already, the stub commit makes it public
   base="${base:-$remote/main}"

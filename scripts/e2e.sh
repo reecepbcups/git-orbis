@@ -67,6 +67,12 @@ git orbis status >/dev/null && ok "status clean after -f" || fail "status still 
 gitq alice commit -qm "fix leak"
 git log -p -1 -- .env.leak | grep -q plain-leak && ok "git log -p shows plaintext via textconv" || fail "textconv: $(git log -p -1 -- .env.leak)"
 
+echo "==> repo format version"
+[ "$(cat .orbis/version)" = 1 ] && ok "sync wrote .orbis/version" || fail "version: $(cat .orbis/version 2>&1)"
+echo 99 > .orbis/version
+git orbis sync >/dev/null 2>&1 && fail "sync ran on a newer repo format" || ok "sync refuses newer repo format"
+echo 1 > .orbis/version
+
 echo "==> new rule works without sync"
 echo '.secrets/*  @all' >> .orbis/access
 mkdir .secrets; echo "TOKEN=staging-only" > .secrets/staging
