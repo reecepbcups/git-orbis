@@ -13,7 +13,7 @@
 #   git orbis push-private <branch> [remote] [base]  push branch encrypted, see branch: rules
 #   git orbis fetch-private <branch> [remote]        decrypt it into a local branch
 #   git orbis private-publish [--yes] <branch> <new-name> [remote]  make it public for good
-#   git orbis clean|smudge    called by git, not you
+#   git orbis clean|smudge|textconv  called by git, not you
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -294,6 +294,11 @@ cmd_smudge() {
   cp "$tmp" "$(cache_dir)/$sha"
 }
 
+# diff.orbis.textconv, so git diff and log -p show real contents. no access shows the pointer.
+cmd_textconv() { # file
+  is_pointer <"$1" && decrypt "$1" 2>/dev/null || cat "$1"
+}
+
 whoami_did() { need_identity; cli reader-did | cut -d= -f2; }
 
 cmd_init() { # [--global]
@@ -306,6 +311,7 @@ cmd_init() { # [--global]
   git config $scope filter.orbis.smudge "\"$HERE/git-orbis\" smudge %f"
   # if clean fails git must stop, never fall back to committing plaintext
   git config $scope filter.orbis.required true
+  git config $scope diff.orbis.textconv "\"$HERE/git-orbis\" textconv"
   [ -n "$scope" ] || set_pushurl
   echo "git-orbis filter installed${scope:+ ($scope)}"
 }
@@ -416,6 +422,7 @@ cmd_sync() {
   {
     echo "# git-orbis begin, .orbis/access decides what gets encrypted"
     echo "* filter=orbis"
+    access_rules | awk '{print $1, "diff=orbis"}'
     echo "# git-orbis end"
   } >>"$tmp"
   cat "$tmp" >"$f"; rm -f "$tmp"
@@ -618,6 +625,7 @@ ask_private() { # name
 case "${1:-}" in
   clean) shift; cmd_clean "$@" ;;
   smudge) shift; cmd_smudge "$@" ;;
+  textconv) shift; cmd_textconv "$@" ;;
   init) cmd_init ;;
   install) cmd_install ;;
   refresh) cmd_refresh ;;

@@ -78,6 +78,7 @@ clone mallory 2>"$W/mallory.err"
 head -1 "$W/mallory/.env" | grep -qx "orbis-git v1" && ok "mallory only sees pointer" || fail "mallory got: $(cat "$W/mallory/.env")"
 grep -q "no access" "$W/mallory.err" && ok "mallory told she has no access" || fail "no warning for mallory"
 [ -z "$(as mallory git status --porcelain)" ] && ok "mallory tree clean" || fail "mallory dirty"
+as mallory git log -p -- .env 2>/dev/null | grep -q hunter2 && fail "mallory diff shows plaintext" || ok "mallory diff only shows pointers"
 
 echo "==> alice rotates secret, bob pulls"
 cd "$W/alice"
