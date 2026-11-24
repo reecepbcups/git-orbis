@@ -7,6 +7,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$ROOT/scripts/env.sh"
 [ -f "$ROOT/.orbis-ring.env" ] || { echo "run make setup first" >&2; exit 1; }
 export PATH="$ROOT/bin:$PATH"
+# CI runners have no git identity, and push-private makes its own commit
+export GIT_AUTHOR_NAME=e2e GIT_AUTHOR_EMAIL=e2e@example.com GIT_COMMITTER_NAME=e2e GIT_COMMITTER_EMAIL=e2e@example.com
 
 W="$ROOT/.e2e"; rm -rf "$W"; mkdir -p "$W"
 pass=0
