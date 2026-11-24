@@ -40,8 +40,8 @@ printf '%s\nAPI_KEY=abc123\n' "$SECRET1" > .env
 echo "DEBUG=1" > .env.development
 echo "$PROD" > .env.production
 echo "hello" > README.md
-# 2.5MB of binary, 3 chunks at the default 1MB
-head -c 2500000 /dev/urandom > .env.blob
+# 120KB of binary, 3 chunks at the default 48KB
+head -c 120000 /dev/urandom > .env.blob
 git add -A
 gitq alice commit -qm "init with encrypted env"
 git push -q origin main
@@ -86,7 +86,7 @@ echo "==> bob (reader) clones"
 clone bob
 grep -q hunter2 "$W/bob/.env" && ok "bob decrypts .env" || fail "bob got: $(cat "$W/bob/.env")"
 [ "$(git -C "$W/origin.git" show main:.env.blob | grep -c '^object: ')" = 3 ] && ok ".env.blob stored as 3 chunks" || fail "chunks: $(git -C "$W/origin.git" show main:.env.blob)"
-cmp -s "$W/alice/.env.blob" "$W/bob/.env.blob" && ok "bob decrypts 2.5MB binary .env.blob" || fail "bob .env.blob differs"
+cmp -s "$W/alice/.env.blob" "$W/bob/.env.blob" && ok "bob decrypts 120KB binary .env.blob" || fail "bob .env.blob differs"
 grep -q DEBUG=1 "$W/bob/.env.development" && ok "bob decrypts .env.development" || fail "bob dev: $(cat "$W/bob/.env.development")"
 head -1 "$W/bob/.env.production" | grep -qx "orbis-git v1" && ok "bob (not ops) can't read .env.production" || fail "bob read prod"
 [ -z "$(as bob git status --porcelain)" ] && ok "bob tree clean" || fail "bob dirty"

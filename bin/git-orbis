@@ -266,7 +266,8 @@ cmd_clean() { # path
   dids="$(readers_for "${1:-}")" || exit 1
   # a tx has a max size, so big files go up as chunks, one object each.
   # the pointer lists them in order, a small file is a list of one.
-  split -b "${ORBIS_CHUNK_BYTES:-1048576}" "$tmp" "$tmp.part."
+  # 48KB since a chunk is ~4.8x bigger on the wire and nodes cap requests at 256KB.
+  split -b "${ORBIS_CHUNK_BYTES:-49152}" "$tmp" "$tmp.part."
   [ -s "$tmp" ] || : >"$tmp.part.aa"
   for part in "$tmp".part.??; do
     base64 <"$part" | tr -d '\n' >"$part.b64"
