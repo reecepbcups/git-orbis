@@ -80,6 +80,15 @@ export PATH="$HOME/git-orbis/bin:$PATH"   # put it in your shell rc
 git orbis install                             # global filter, zsh completion, creates ~/.ssh/git-orbis, prints your DID
 ```
 
+No rust toolchain? Grab a release instead of cloning. Mac and Linux, amd64 and arm64:
+
+```bash
+v=v1.1.0; os=darwin; arch=arm64   # or linux / amd64
+curl -fsSL "https://github.com/reecepbcups/git-orbis/releases/download/$v/git-orbis-$v-$os-$arch.tar.gz" | tar -xz -C ~
+```
+
+That unpacks to `~/git-orbis`, same PATH line as above. Later on, `git orbis update` checks for a newer release, asks y/n, and only installs it if `SHA256SUMS` is signed by the `release.pub` you already have and the tarball matches it. It won't downgrade you.
+
 After that a plain `git clone` of a repo using git-orbis decrypts on its own. If you got access after cloning, `git orbis refresh`.
 
 Adding it to a repo:
