@@ -1,7 +1,10 @@
 ORBIS_REV := 51162e596fb7135a5617ee56f9ad52f8a7a094a4
 COMPOSE := docker compose -p git-orbis -f orbis/docker-compose.yml
+# prebuilt by CI, tagged by the Dockerfile hash so any change to it is a new image
+VERA_IMAGE ?= ghcr.io/reecepbcups/git-orbis-vera:$(shell git hash-object orbis/vera.Dockerfile | cut -c1-12)
+export VERA_IMAGE
 
-.PHONY: tools filter test up setup e2e down
+.PHONY: tools filter test up setup e2e down vera-image
 
 # patched orbis cli-tool (jubjub, matches the node image) + the git filter process
 tools: .tools/bin/cli-tool filter
@@ -32,3 +35,6 @@ e2e: tools
 down:
 	$(COMPOSE) down -v
 	rm -f .orbis-ring.env
+
+vera-image:
+	@echo $(VERA_IMAGE)

@@ -2,6 +2,7 @@
 # deployments/orbis stack, no defra. Passwords and keys here are local fixtures.
 # orbis-rs is public and digest pinned. vera is built from vera.Dockerfile
 # (pinned commit + mizu cometbft) so blocks only happen when there are txs.
+# make sets VERA_IMAGE to the CI prebuilt, compose builds it if the pull fails.
 x-node: &node
   image: ${ORBIS_IMAGE:-ghcr.io/sourcenetwork/orbis-rs@sha256:2cf79b0524e73a7b4f069b6a288c7f18e91d8c87aba8f785cd874d07ee76d59e}
   restart: on-failure
@@ -15,7 +16,7 @@ x-node-cmd: &node-cmd ["--addr", "0.0.0.0:50051", "--log-level", "info", "--serv
 services:
   vera:
     build: {context: ., dockerfile: vera.Dockerfile}
-    image: git-orbis-vera:mizu
+    image: ${VERA_IMAGE:-git-orbis-vera:local}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -79,7 +80,7 @@ services:
   # nodes don't self-fund, so pay each one's vera account from the genesis funder
   funder:
     build: {context: ., dockerfile: vera.Dockerfile}
-    image: git-orbis-vera:mizu
+    image: ${VERA_IMAGE:-git-orbis-vera:local}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |

@@ -1,0 +1,139 @@
+name: E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # Vera only changes with vera.Dockerfile, so it's pushed to GHCR once per
+  # Dockerfile hash and later runs (and local `make up`) just pull it.
+  vera-check:
+    runs-on: ubuntu-24.04
+    outputs:
+      image: ${{ steps.check.outputs.image }}
+      missing: ${{ steps.check.outputs.missing }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          image=$(make -s vera-image)
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+            echo "cached: $image"
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "missing: $image"
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Native runners per arch, QEMU on a cosmos build is way too slow.
+  vera-build:
+    needs: vera-check
+    if: needs.vera-check.outputs.missing == 'true'
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Fork guard
+        if: github.event.pull_request.head.repo.fork == true
+        run: |
+          echo "::error::${{ needs.vera-check.outputs.image }} isn't in GHCR and fork PRs can't push. Push it from the main repo first."
+          exit 1
+
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build and push
+        env:
+          IMAGE: ${{ needs.vera-check.outputs.image }}
+        run: |
+          docker buildx build --progress=plain \
+            --platform linux/${{ matrix.arch }} \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --file orbis/vera.Dockerfile \
+            --tag "$IMAGE-${{ matrix.arch }}" --push orbis
+
+  vera-merge:
+    needs: [vera-check, vera-build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Multi-arch manifest
+        env:
+          IMAGE: ${{ needs.vera-check.outputs.image }}
+        run: docker buildx imagetools create -t "$IMAGE" "$IMAGE-amd64" "$IMAGE-arm64"
+
+  e2e:
+    needs: [vera-check, vera-merge]
+    # vera-build/merge are skipped when the image is already in GHCR, that's fine.
+    if: ${{ !cancelled() && needs.vera-check.result == 'success' && needs.vera-merge.result != 'failure' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: cli-tool cache key
+        id: rev
+        run: echo "rev=$(sed -n 's/^ORBIS_REV := //p' Makefile)" >> "$GITHUB_OUTPUT"
+
+      # patched cli-tool only changes with the orbis rev or the patch
+      - name: Cache cli-tool
+        id: cli-cache
+        uses: actions/cache@v4
+        with:
+          path: .tools/bin/cli-tool
+          key: cli-tool-${{ runner.os }}-${{ steps.rev.outputs.rev }}-${{ hashFiles('patches/cli-tool.patch') }}
+
+      - name: Install cli-tool build deps
+        if: steps.cli-cache.outputs.cache-hit != 'true'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler libssl-dev pkg-config libdbus-1-dev
+
+      - name: Build tools
+        run: make tools
+
+      - name: Pull vera
+        run: docker pull "$(make -s vera-image)"
+
+      - name: Start stack
+        timeout-minutes: 10
+        run: make up
+
+      - name: Setup ring
+        run: make setup
+
+      - name: E2E
+        run: make e2e
+
+      - name: Stack logs
+        if: failure()
+        run: docker compose -p git-orbis -f orbis/docker-compose.yml logs --tail 200
+
+      - name: Teardown
+        if: always()
+        run: make down
