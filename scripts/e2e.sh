@@ -55,6 +55,18 @@ git -C "$W/origin.git" cat-file --batch-all-objects --batch | grep -qE 'hunter2|
 [ -z "$(git status --porcelain)" ] && ok "alice tree clean" || fail "alice dirty: $(git status --porcelain)"
 [ "$(git -C "$W/origin.git" show main:README.md)" = hello ] && ok "files outside .orbis/access stay plaintext" || fail "README got filtered"
 
+echo "==> status + diff"
+git orbis status | grep -qE 'encrypted  \.env$' && ok "status lists .env encrypted" || fail "status: $(git orbis status 2>&1)"
+# sneak plaintext past the filter, like a clone that never ran install
+printf 'LEAK=plain-leak\n' > .env.leak
+git update-index --add --cacheinfo "100644,$(git hash-object -w --no-filters .env.leak),.env.leak"
+git orbis status >/dev/null 2>&1 && fail "status missed plaintext .env.leak" || ok "status flags plaintext .env.leak"
+git orbis status -f >/dev/null
+head -1 <(git show :.env.leak) | grep -qx "orbis-git v1" && ok "status -f re-adds it encrypted" || fail "still plaintext: $(git show :.env.leak)"
+git orbis status >/dev/null && ok "status clean after -f" || fail "status still unhappy"
+gitq alice commit -qm "fix leak"
+git log -p -1 -- .env.leak | grep -q plain-leak && ok "git log -p shows plaintext via textconv" || fail "textconv: $(git log -p -1 -- .env.leak)"
+
 echo "==> new rule works without sync"
 echo '.secrets/*  @all' >> .orbis/access
 mkdir .secrets; echo "TOKEN=staging-only" > .secrets/staging

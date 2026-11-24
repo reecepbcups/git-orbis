@@ -9,6 +9,7 @@
 #   git orbis access <pattern> <owner>...  set who reads a path, or branch:<glob>
 #   git orbis sync            point .gitattributes at .orbis/access, re-grant every file
 #   git orbis refresh         decrypt again, e.g. after you got access
+#   git orbis status [-f]     list encrypted files, flag plaintext ones a rule covers. -f re-adds them
 #   git orbis init            filter for this clone only (instead of install)
 #   git orbis push-private <branch> [remote] [base]  push branch encrypted, see branch: rules
 #   git orbis fetch-private <branch> [remote]        decrypt it into a local branch
@@ -360,6 +361,48 @@ install_completion() {
   echo "zsh completion linked, open a new terminal"
 }
 
+# what's encrypted, and anything a rule covers that git still stores as
+# plaintext. -f re-adds those through the filter, like git-crypt status -f.
+cmd_status() { # [-f]
+  local fix= attrs ptrs out path
+  local -a bad=()
+  case "${1:-}" in "") ;; -f) fix=1 ;; *) die "usage: git orbis status [-f]" ;; esac
+  cd "$(top)"
+  attrs="$(mktemp)"; ptrs="$(mktemp)"; trap 'rm -f "$attrs" "$ptrs"' RETURN
+  access_rules | awk '{print $1, "orbis-rule"}' >"$attrs"
+  pointer_files >"$ptrs"
+  # one check-attr for the whole repo, per file calls are too slow on big repos
+  out="$(git ls-files -z | git -c core.attributesFile="$attrs" check-attr --stdin -z orbis-rule filter \
+    | tr '\0' '\n' | paste - - - | awk -F'\t' -v rules="$(access_rules | wc -l)" -v ptrs="$ptrs" '
+      BEGIN { while ((getline l < ptrs) > 0) ptr[l] = 1 }
+      $1 == ".gitattributes" || $1 ~ /^\.orbis\// { next }
+      !($1 in seen) { seen[$1] = 1; order[++n] = $1 }
+      { attr[$1, $2] = $3 }
+      END {
+        for (i = 1; i <= n; i++) {
+          f = order[i]; filt = attr[f, "filter"] == "orbis"
+          want = rules > 0 ? attr[f, "orbis-rule"] == "set" : filt
+          if (f in ptr) print (filt ? "encrypted" : "nofilter") "\t" f
+          else if (want) print (filt ? "plaintext" : "nofilter") "\t" f
+        }
+      }')"
+  [ -n "$out" ] || { echo "nothing covered by .orbis/access"; return 0; }
+  awk -F'\t' '{ printf "%14s  %s\n", $1 == "encrypted" ? "encrypted" : $1 == "plaintext" ? "NOT ENCRYPTED" : "NO FILTER", $2 }' <<<"$out"
+
+  if grep -q '^nofilter' <<<"$out"; then
+    echo "git-orbis: .gitattributes doesn't send these through the filter, run 'git orbis sync'" >&2
+    [ -z "$fix" ] || exit 1
+  fi
+  while IFS=$'\t' read -r _ path; do bad+=("$path"); done < <(grep '^plaintext' <<<"$out" || true)
+  [ ${#bad[@]} -gt 0 ] || { grep -q '^nofilter' <<<"$out" && exit 1; return 0; }
+  if [ -z "$fix" ]; then
+    echo "git-orbis: ${#bad[@]} file(s) a rule covers are committed as plaintext, 'git orbis status -f' to fix" >&2
+    exit 1
+  fi
+  git add --renormalize -- "${bad[@]}"
+  echo "re-added ${#bad[@]} file(s) encrypted, commit them. old commits still have the plaintext, rotate those secrets."
+}
+
 # re-run the decrypt, e.g. after someone granted you access
 cmd_refresh() {
   local path
@@ -626,6 +669,7 @@ case "${1:-}" in
   clean) shift; cmd_clean "$@" ;;
   smudge) shift; cmd_smudge "$@" ;;
   textconv) shift; cmd_textconv "$@" ;;
+  status) shift; cmd_status "$@" ;;
   init) cmd_init ;;
   install) cmd_install ;;
   refresh) cmd_refresh ;;
@@ -637,5 +681,5 @@ case "${1:-}" in
   access) shift; cmd_access "$@" ;;
   remote-helper) shift; cmd_remote_helper "$@" ;;
   private-publish) shift; cmd_private_publish "$@" ;;
-  *) sed -n '2,17p' "$0"; exit 1 ;;
+  *) sed -n '2,18p' "$0"; exit 1 ;;
 esac
