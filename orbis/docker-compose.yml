@@ -32,6 +32,9 @@ services:
           verad genesis add-genesis-account funder 1000000000000000000000uopen --keyring-backend test --home /home/node/.vera
           verad genesis gentx validator 10000000000uopen --keyring-backend test --chain-id vera-localnet --home /home/node/.vera
           verad genesis collect-gentxs --home /home/node/.vera
+          # 100MB blocks (the cometbft max) so parallel chunk uploads all fit in one
+          sed -i 's/"max_bytes": "22020096"/"max_bytes": "104857600"/' /home/node/.vera/config/genesis.json
+          grep -q '"max_bytes": "104857600"' /home/node/.vera/config/genesis.json
         fi
         # only make blocks for txs, with an empty heartbeat block a day if idle
         CFG=/home/node/.vera/config/config.toml
